@@ -2,5 +2,5 @@ fastapi
 uvicorn
 sqlalchemy
 pydantic
-python-jose
 python-multipart
+pyjwt

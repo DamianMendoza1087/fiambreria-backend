@@ -21,7 +21,9 @@ class UserDB(Base):
     hashed_password = Column(String, nullable=False)
     role = Column(String, default="vendedor")
     is_active = Column(Boolean, default=True)
-    is_cashier_active = Column(Boolean, default=False)
+    can_preventa = Column(Boolean, default=True)
+    can_caja = Column(Boolean, default=False)
+    can_stock = Column(Boolean, default=False)
 
 class ProductDB(Base):
     __tablename__ = "products"
@@ -78,11 +80,26 @@ def init_db():
     db = SessionLocal()
     admin = db.query(UserDB).filter(UserDB.email == "admin@fiambreria.com").first()
     if not admin:
-        db.add(UserDB(name="Super Admin", email="admin@fiambreria.com", hashed_password="admin123", role="superadmin", is_active=True, is_cashier_active=True))
+        db.add(UserDB(
+            name="Super Admin",
+            email="admin@fiambreria.com",
+            hashed_password="admin123",
+            role="superadmin",
+            is_active=True,
+            can_preventa=True,
+            can_caja=True,
+            can_stock=True
+        ))
         db.commit()
     db.close()
 
 init_db()
+
+class PermissionsSchema(BaseModel):
+    is_active: Optional[bool] = None
+    can_preventa: Optional[bool] = None
+    can_caja: Optional[bool] = None
+    can_stock: Optional[bool] = None
 
 class ItemSchema(BaseModel):
     product_id: int
@@ -108,16 +125,20 @@ class ProductCreateSchema(BaseModel):
     barcode: Optional[str] = None
     is_active: Optional[bool] = True
 
-class UserUpdateSchema(BaseModel):
-    is_active: Optional[bool] = None
-    role: Optional[str] = None
-
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(UserDB).filter(UserDB.email == form_data.username).first()
     if not user or user.hashed_password != form_data.password:
         raise HTTPException(status_code=400, detail="Credenciales incorrectas")
-    return {"access_token": f"token-{user.id}", "token_type": "bearer", "role": user.role}
+    return {
+        "access_token": f"token-{user.id}",
+        "token_type": "bearer",
+        "role": user.role,
+        "is_active": user.is_active,
+        "can_preventa": user.can_preventa,
+        "can_caja": user.can_caja,
+        "can_stock": user.can_stock
+    }
 
 @app.get("/users")
 def get_users(db: Session = Depends(get_db)):
@@ -125,33 +146,30 @@ def get_users(db: Session = Depends(get_db)):
 
 @app.post("/users")
 def create_user(user_data: dict, db: Session = Depends(get_db)):
-    new_u = UserDB(name=user_data["name"], email=user_data["email"], hashed_password=user_data["password"], role=user_data["role"], is_active=False)
+    new_u = UserDB(
+        name=user_data["name"],
+        email=user_data["email"],
+        hashed_password=user_data["password"],
+        role=user_data.get("role", "vendedor"),
+        is_active=False,
+        can_preventa=True,
+        can_caja=False,
+        can_stock=False
+    )
     db.add(new_u); db.commit(); db.refresh(new_u)
     return new_u
 
-@app.patch("/users/{user_id}")
-def update_user(user_id: int, payload: UserUpdateSchema, db: Session = Depends(get_db)):
+@app.patch("/users/{user_id}/permissions")
+def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends(get_db)):
     u = db.query(UserDB).filter(UserDB.id == user_id).first()
     if not u:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    if payload.is_active is not None:
-        u.is_active = payload.is_active
-    if payload.role is not None:
-        u.role = payload.role
-    db.commit()
-    db.refresh(u)
+    if p.is_active is not None: u.is_active = p.is_active
+    if p.can_preventa is not None: u.can_preventa = p.can_preventa
+    if p.can_caja is not None: u.can_caja = p.can_caja
+    if p.can_stock is not None: u.can_stock = p.can_stock
+    db.commit(); db.refresh(u)
     return u
-
-@app.patch("/users/{user_id}/activate-cashier")
-def set_active_cashier(user_id: int, db: Session = Depends(get_db)):
-    db.query(UserDB).update({"is_cashier_active": False})
-    u = db.query(UserDB).filter(UserDB.id == user_id).first()
-    if u:
-        u.is_cashier_active = True
-        u.is_active = True
-        db.commit()
-        return {"status": "ok"}
-    raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
 @app.get("/products")
 def get_products(db: Session = Depends(get_db)):
@@ -218,8 +236,8 @@ def delete_presale(presale_id: int, db: Session = Depends(get_db)):
     if ps:
         ps.status = "CANCELADA"
         db.commit()
-        return {"status": "ok", "message": "Pre-venta cancelada"}
-    raise HTTPException(status_code=404, detail="Pre-venta no encontrada")
+        return {"status": "ok"}
+    raise HTTPException(status_code=404, detail="No encontrada")
 
 @app.post("/sales/finalize")
 def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
@@ -243,4 +261,4 @@ def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
             ps.status = "COMPLETADA"
 
     db.commit()
-    return {"status": "success", "message": "Venta procesada con éxito"}
+    return {"status": "success", "message": "Venta procesada"}

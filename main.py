@@ -108,6 +108,10 @@ class ProductCreateSchema(BaseModel):
     barcode: Optional[str] = None
     is_active: Optional[bool] = True
 
+class UserUpdateSchema(BaseModel):
+    is_active: Optional[bool] = None
+    role: Optional[str] = None
+
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(UserDB).filter(UserDB.email == form_data.username).first()
@@ -121,15 +125,32 @@ def get_users(db: Session = Depends(get_db)):
 
 @app.post("/users")
 def create_user(user_data: dict, db: Session = Depends(get_db)):
-    new_u = UserDB(name=user_data["name"], email=user_data["email"], hashed_password=user_data["password"], role=user_data["role"])
+    new_u = UserDB(name=user_data["name"], email=user_data["email"], hashed_password=user_data["password"], role=user_data["role"], is_active=False)
     db.add(new_u); db.commit(); db.refresh(new_u)
     return new_u
+
+@app.patch("/users/{user_id}")
+def update_user(user_id: int, payload: UserUpdateSchema, db: Session = Depends(get_db)):
+    u = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    if payload.is_active is not None:
+        u.is_active = payload.is_active
+    if payload.role is not None:
+        u.role = payload.role
+    db.commit()
+    db.refresh(u)
+    return u
 
 @app.patch("/users/{user_id}/activate-cashier")
 def set_active_cashier(user_id: int, db: Session = Depends(get_db)):
     db.query(UserDB).update({"is_cashier_active": False})
     u = db.query(UserDB).filter(UserDB.id == user_id).first()
-    if u: u.is_cashier_active = True; db.commit(); return {"status": "ok"}
+    if u:
+        u.is_cashier_active = True
+        u.is_active = True
+        db.commit()
+        return {"status": "ok"}
     raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
 @app.get("/products")
@@ -147,14 +168,9 @@ def update_product(product_id: int, prod: ProductCreateSchema, db: Session = Dep
     p = db.query(ProductDB).filter(ProductDB.id == product_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
-    p.name = prod.name
-    p.category = prod.category
-    p.price_per_unit = prod.price_per_unit
-    p.unit_type = prod.unit_type
-    p.stock = prod.stock
-    p.barcode = prod.barcode
-    db.commit()
-    db.refresh(p)
+    p.name = prod.name; p.category = prod.category; p.price_per_unit = prod.price_per_unit
+    p.unit_type = prod.unit_type; p.stock = prod.stock; p.barcode = prod.barcode
+    db.commit(); db.refresh(p)
     return p
 
 @app.delete("/products/{product_id}")
@@ -195,6 +211,15 @@ def get_pending_presales(db: Session = Depends(get_db)):
         items = [{"product_id": i.product_id, "name": i.product_name, "price_per_unit": i.price_per_unit, "unit_type": i.unit_type, "qty": i.quantity} for i in ps.items]
         result.append({"id": ps.id, "created_at": ps.created_at.strftime("%H:%M"), "total": ps.total_amount, "items": items})
     return result
+
+@app.delete("/presales/{presale_id}")
+def delete_presale(presale_id: int, db: Session = Depends(get_db)):
+    ps = db.query(PreSaleDB).filter(PreSaleDB.id == presale_id).first()
+    if ps:
+        ps.status = "CANCELADA"
+        db.commit()
+        return {"status": "ok", "message": "Pre-venta cancelada"}
+    raise HTTPException(status_code=404, detail="Pre-venta no encontrada")
 
 @app.post("/sales/finalize")
 def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):

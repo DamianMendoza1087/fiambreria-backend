@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime
@@ -13,7 +13,6 @@ engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELOS SQLALCHEMY ---
 class UserDB(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -30,7 +29,7 @@ class ProductDB(Base):
     name = Column(String, nullable=False)
     category = Column(String, default="Fiambres")
     price_per_unit = Column(Float, nullable=False)
-    unit_type = Column(String, default="kg")
+    unit_type = Column(String, default="unid")
     stock = Column(Float, default=0.0)
     barcode = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
@@ -39,7 +38,7 @@ class PreSaleDB(Base):
     __tablename__ = "presales"
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    status = Column(String, default="PENDIENTE") # PENDIENTE / COMPLETADA / CANCELADA
+    status = Column(String, default="PENDIENTE")
     total_amount = Column(Float, default=0.0)
     items = relationship("PreSaleItemDB", back_populates="presale", cascade="all, delete-orphan")
 
@@ -50,6 +49,7 @@ class PreSaleItemDB(Base):
     product_id = Column(Integer, ForeignKey("products.id"))
     product_name = Column(String)
     price_per_unit = Column(Float)
+    unit_type = Column(String, default="unid")
     quantity = Column(Float)
     presale = relationship("PreSaleDB", back_populates="items")
 
@@ -60,7 +60,7 @@ class SaleDB(Base):
     total_amount = Column(Float, nullable=False)
     amount_cash = Column(Float, default=0.0)
     amount_mp = Column(Float, default=0.0)
-    payment_method = Column(String, default="Efectivo") # Efectivo, Mercado Pago, Mixto
+    payment_method = Column(String, default="Efectivo")
 
 Base.metadata.create_all(bind=engine)
 
@@ -84,7 +84,6 @@ def init_db():
 
 init_db()
 
-# --- SCHEMAS PYDANTIC ---
 class ItemSchema(BaseModel):
     product_id: int
     quantity: float
@@ -100,7 +99,15 @@ class FinalizeSaleSchema(BaseModel):
     amount_mp: float
     payment_method: str
 
-# --- ENDPOINTS ---
+class ProductCreateSchema(BaseModel):
+    name: str
+    category: Optional[str] = "Varios"
+    price_per_unit: float
+    unit_type: Optional[str] = "unid"
+    stock: float
+    barcode: Optional[str] = None
+    is_active: Optional[bool] = True
+
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(UserDB).filter(UserDB.email == form_data.username).first()
@@ -130,8 +137,25 @@ def get_products(db: Session = Depends(get_db)):
     return db.query(ProductDB).filter(ProductDB.is_active == True).all()
 
 @app.post("/products")
-def create_product(prod: dict, db: Session = Depends(get_db)):
-    p = ProductDB(**prod); db.add(p); db.commit(); db.refresh(p); return p
+def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db)):
+    p = ProductDB(**prod.dict())
+    db.add(p); db.commit(); db.refresh(p)
+    return p
+
+@app.put("/products/{product_id}")
+def update_product(product_id: int, prod: ProductCreateSchema, db: Session = Depends(get_db)):
+    p = db.query(ProductDB).filter(ProductDB.id == product_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    p.name = prod.name
+    p.category = prod.category
+    p.price_per_unit = prod.price_per_unit
+    p.unit_type = prod.unit_type
+    p.stock = prod.stock
+    p.barcode = prod.barcode
+    db.commit()
+    db.refresh(p)
+    return p
 
 @app.delete("/products/{product_id}")
 def delete_product(product_id: int, db: Session = Depends(get_db)):
@@ -139,13 +163,11 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
     if p: p.is_active = False; db.commit(); return {"status": "ok"}
     raise HTTPException(status_code=404, detail="No encontrado")
 
-# --- ENDPOINTS PRE-VENTA Y CAJA ---
 @app.post("/presales")
 def create_presale(payload: PreSaleCreateSchema, db: Session = Depends(get_db)):
     total = 0.0
     presale = PreSaleDB(status="PENDIENTE")
-    db.add(presale)
-    db.flush()
+    db.add(presale); db.flush()
 
     for item in payload.items:
         prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
@@ -157,6 +179,7 @@ def create_presale(payload: PreSaleCreateSchema, db: Session = Depends(get_db)):
                 product_id=prod.id,
                 product_name=prod.name,
                 price_per_unit=prod.price_per_unit,
+                unit_type=prod.unit_type,
                 quantity=item.quantity
             ))
     
@@ -169,13 +192,12 @@ def get_pending_presales(db: Session = Depends(get_db)):
     presales = db.query(PreSaleDB).filter(PreSaleDB.status == "PENDIENTE").all()
     result = []
     for ps in presales:
-        items = [{"product_id": i.product_id, "name": i.product_name, "price_per_unit": i.price_per_unit, "qty": i.quantity} for i in ps.items]
+        items = [{"product_id": i.product_id, "name": i.product_name, "price_per_unit": i.price_per_unit, "unit_type": i.unit_type, "qty": i.quantity} for i in ps.items]
         result.append({"id": ps.id, "created_at": ps.created_at.strftime("%H:%M"), "total": ps.total_amount, "items": items})
     return result
 
 @app.post("/sales/finalize")
 def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
-    # 1. Registrar venta final
     sale = SaleDB(
         presale_id=payload.presale_id,
         total_amount=payload.total_amount,
@@ -185,13 +207,11 @@ def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
     )
     db.add(sale)
 
-    # 2. Descontar Stock
     for item in payload.items:
         prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
         if prod:
-            prod.stock -= item.quantity
+            prod.stock = max(0.0, prod.stock - item.quantity)
 
-    # 3. Marcar pre-venta como completada
     if payload.presale_id:
         ps = db.query(PreSaleDB).filter(PreSaleDB.id == payload.presale_id).first()
         if ps:

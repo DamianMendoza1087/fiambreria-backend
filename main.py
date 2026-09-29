@@ -31,7 +31,9 @@ class ProductDB(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     category = Column(String, default="Fiambres")
-    price_per_unit = Column(Float, nullable=False)
+    cost_price = Column(Float, default=0.0) # Costo de Compra
+    price_per_unit = Column(Float, nullable=False) # Precio de Venta
+    supplier = Column(String, nullable=True) # Nombre Proveedor
     unit_type = Column(String, default="unid")
     stock = Column(Float, default=0.0)
     last_counted_qty = Column(Float, nullable=True)
@@ -128,7 +130,9 @@ class FinalizeSaleSchema(BaseModel):
 class ProductCreateSchema(BaseModel):
     name: str
     category: Optional[str] = "Varios"
+    cost_price: Optional[float] = 0.0
     price_per_unit: float
+    supplier: Optional[str] = None
     unit_type: Optional[str] = "unid"
     stock: float
     barcode: Optional[str] = None
@@ -198,8 +202,14 @@ def update_product(product_id: int, prod: ProductCreateSchema, db: Session = Dep
     p = db.query(ProductDB).filter(ProductDB.id == product_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
-    p.name = prod.name; p.category = prod.category; p.price_per_unit = prod.price_per_unit
-    p.unit_type = prod.unit_type; p.stock = prod.stock; p.barcode = prod.barcode
+    p.name = prod.name
+    p.category = prod.category
+    p.cost_price = prod.cost_price
+    p.price_per_unit = prod.price_per_unit
+    p.supplier = prod.supplier
+    p.unit_type = prod.unit_type
+    p.stock = prod.stock
+    p.barcode = prod.barcode
     db.commit(); db.refresh(p)
     return p
 

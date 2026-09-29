@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, Date
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel
@@ -31,9 +31,9 @@ class ProductDB(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     category = Column(String, default="Fiambres")
-    cost_price = Column(Float, default=0.0) # Costo de Compra
-    price_per_unit = Column(Float, nullable=False) # Precio de Venta
-    supplier = Column(String, nullable=True) # Nombre Proveedor
+    cost_price = Column(Float, default=0.0)
+    price_per_unit = Column(Float, nullable=False)
+    supplier = Column(String, nullable=True)
     unit_type = Column(String, default="unid")
     stock = Column(Float, default=0.0)
     last_counted_qty = Column(Float, nullable=True)
@@ -64,10 +64,28 @@ class SaleDB(Base):
     __tablename__ = "sales"
     id = Column(Integer, primary_key=True, index=True)
     presale_id = Column(Integer, nullable=True)
+    session_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
     total_amount = Column(Float, nullable=False)
     amount_cash = Column(Float, default=0.0)
     amount_mp = Column(Float, default=0.0)
     payment_method = Column(String, default="Efectivo")
+
+class CashSessionDB(Base):
+    __tablename__ = "cash_sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(String, nullable=False) # YYYY-MM-DD
+    opened_at = Column(DateTime, default=datetime.datetime.utcnow)
+    opened_by = Column(String, nullable=False)
+    initial_amount = Column(Float, default=0.0)
+    is_open = Column(Boolean, default=True)
+    closed_at = Column(DateTime, nullable=True)
+    closed_by = Column(String, nullable=True)
+    reported_cash = Column(Float, nullable=True)
+    expected_cash = Column(Float, nullable=True)
+    total_mp = Column(Float, nullable=True)
+    difference = Column(Float, nullable=True)
+    status_message = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -137,6 +155,15 @@ class ProductCreateSchema(BaseModel):
     stock: float
     barcode: Optional[str] = None
     is_active: Optional[bool] = True
+
+class CashOpenSchema(BaseModel):
+    initial_amount: float
+    opened_by: str
+
+class CashCloseSchema(BaseModel):
+    reported_cash: float
+    closed_by: str
+    attempt_number: int
 
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -271,10 +298,46 @@ def delete_presale(presale_id: int, db: Session = Depends(get_db)):
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="No encontrada")
 
+# GESTIÓN DE CAJA Y ARQUEO
+@app.get("/cash/status")
+def get_cash_status(db: Session = Depends(get_db)):
+    active_session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
+    if not active_session:
+        return {"is_open": False}
+    return {
+        "is_open": True,
+        "session_id": active_session.id,
+        "opened_by": active_session.opened_by,
+        "opened_at": active_session.opened_at.strftime("%H:%M hs"),
+        "initial_amount": active_session.initial_amount
+    }
+
+@app.post("/cash/open")
+def open_cash(payload: CashOpenSchema, db: Session = Depends(get_db)):
+    active = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
+    if active:
+        raise HTTPException(status_code=400, detail="La caja ya se encuentra abierta")
+    
+    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    session = CashSessionDB(
+        date=today_str,
+        opened_by=payload.opened_by,
+        initial_amount=payload.initial_amount,
+        is_open=True
+    )
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+    return {"status": "ok", "session_id": session.id}
+
 @app.post("/sales/finalize")
 def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
+    active_session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
+    session_id = active_session.id if active_session else None
+
     sale = SaleDB(
         presale_id=payload.presale_id,
+        session_id=session_id,
         total_amount=payload.total_amount,
         amount_cash=payload.amount_cash,
         amount_mp=payload.amount_mp,
@@ -294,3 +357,72 @@ def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
 
     db.commit()
     return {"status": "success", "message": "Venta procesada"}
+
+@app.post("/cash/close")
+def close_cash(payload: CashCloseSchema, db: Session = Depends(get_db)):
+    session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
+    if not session:
+        raise HTTPException(status_code=400, detail="No hay una caja abierta para cerrar")
+
+    sales = db.query(SaleDB).filter(SaleDB.session_id == session.id).all()
+    total_cash_sales = sum(s.amount_cash for s in sales)
+    total_mp_sales = sum(s.amount_mp for s in sales)
+    
+    expected_cash = session.initial_amount + total_cash_sales
+    diff = payload.reported_cash - expected_cash
+
+    # 1er Intento: Validación estricta a ciegas
+    if payload.attempt_number == 1 and abs(diff) > 0.01:
+        return {
+            "status": "mismatch_first_attempt",
+            "message": "⚠️ Monto incorrecto. Por favor volvé a contar el dinero e ingresá la cifra nuevamente."
+        }
+
+    # 2do Intento o Coincidencia Exacta: Cierre definitivo
+    session.is_open = False
+    session.closed_at = datetime.datetime.utcnow()
+    session.closed_by = payload.closed_by
+    session.reported_cash = payload.reported_cash
+    session.expected_cash = expected_cash
+    session.total_mp = total_mp_sales
+    session.difference = diff
+
+    if abs(diff) <= 0.01:
+        session.status_message = "Objetivo logrado satisfactoriamente"
+    else:
+        session.status_message = f"Cerrado con diferencia de ${diff:.2f}"
+
+    db.commit()
+    return {
+        "status": "success",
+        "message": session.status_message,
+        "is_correct": abs(diff) <= 0.01
+    }
+
+@app.get("/cash/audits")
+def get_cash_audits(date: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(CashSessionDB)
+    if date:
+        query = query.filter(CashSessionDB.date == date)
+    
+    sessions = query.order_by(CashSessionDB.id.desc()).all()
+    result = []
+    for s in sessions:
+        sales = db.query(SaleDB).filter(SaleDB.session_id == s.id).all()
+        result.append({
+            "id": s.id,
+            "date": s.date,
+            "opened_at": s.opened_at.strftime("%H:%M hs"),
+            "opened_by": s.opened_by,
+            "initial_amount": s.initial_amount,
+            "is_open": s.is_open,
+            "closed_at": s.closed_at.strftime("%H:%M hs") if s.closed_at else "En curso",
+            "closed_by": s.closed_by or "N/A",
+            "reported_cash": s.reported_cash,
+            "expected_cash": s.expected_cash,
+            "total_mp": s.total_mp,
+            "difference": s.difference,
+            "status_message": s.status_message,
+            "total_sales_count": len(sales)
+        })
+    return result

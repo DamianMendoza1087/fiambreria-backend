@@ -1,4 +1,19 @@
-# Agregar en los esquemas de base de datos
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from pydantic import BaseModel
+from typing import List, Optional
+
+# --- CONFIGURACIÓN BASE DE DATOS ---
+SQLALCHEMY_DATABASE_URL = "sqlite:///./fiambreria.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# --- MODELOS SQLALCHEMY ---
 class UserDB(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -9,19 +24,92 @@ class UserDB(Base):
     is_active = Column(Boolean, default=True)
     is_cashier_active = Column(Boolean, default=False)
 
-# Endpoint para listar todos los usuarios (solo Superadmin/Dueño)
+class ProductDB(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    category = Column(String, default="Fiambres")
+    price_per_unit = Column(Float, nullable=False)
+    unit_type = Column(String, default="kg")
+    stock = Column(Float, default=0.0)
+    barcode = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True)
+
+Base.metadata.create_all(bind=engine)
+
+# --- INICIALIZACIÓN FASTAPI ---
+app = FastAPI(title="Fiambrería POS API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Dependencia DB
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Crear usuario Admin por defecto si no existe
+def init_db():
+    db = SessionLocal()
+    admin = db.query(UserDB).filter(UserDB.email == "admin@fiambreria.com").first()
+    if not admin:
+        default_admin = UserDB(
+            name="Super Admin",
+            email="admin@fiambreria.com",
+            hashed_password="admin123",
+            role="superadmin",
+            is_active=True,
+            is_cashier_active=True
+        )
+        db.add(default_admin)
+        db.commit()
+    db.close()
+
+init_db()
+
+# --- ESQUEMAS PYDANTIC ---
+class ProductCreate(BaseModel):
+    name: str
+    category: Optional[str] = "Fiambres"
+    price_per_unit: float
+    unit_type: Optional[str] = "kg"
+    stock: float
+    barcode: Optional[str] = None
+    is_active: Optional[bool] = True
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str
+
+# --- ENDPOINTS AUTH Y USUARIOS ---
+@app.post("/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.email == form_data.username).first()
+    if not user or user.hashed_password != form_data.password:
+        raise HTTPException(status_code=400, detail="Credenciales incorrectas")
+    return {"access_token": f"token-{user.id}", "token_type": "bearer", "role": user.role}
+
 @app.get("/users")
 def get_users(db: Session = Depends(get_db)):
     return db.query(UserDB).all()
 
-# Endpoint para crear un nuevo usuario con Rol
 @app.post("/users")
-def create_user(user_data: dict, db: Session = Depends(get_db)):
+def create_user(user_data: UserCreate, db: Session = Depends(get_db)):
     new_user = UserDB(
-        name=user_data["name"],
-        email=user_data["email"],
-        hashed_password=user_data["password"], # En producción aplicar hash
-        role=user_data["role"],
+        name=user_data.name,
+        email=user_data.email,
+        hashed_password=user_data.password,
+        role=user_data.role,
         is_active=True,
         is_cashier_active=False
     )
@@ -30,15 +118,34 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
     db.refresh(new_user)
     return new_user
 
-# Endpoint para Activar al Cajero Único de Turno
 @app.patch("/users/{user_id}/activate-cashier")
 def set_active_cashier(user_id: int, db: Session = Depends(get_db)):
-    # 1. Desactivar el turno a todos los usuarios
     db.query(UserDB).update({"is_cashier_active": False})
-    # 2. Activar el turno solo al usuario seleccionado
     user = db.query(UserDB).filter(UserDB.id == user_id).first()
     if user:
         user.is_cashier_active = True
         db.commit()
         return {"status": "success", "active_cashier": user.name}
     raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+# --- ENDPOINTS PRODUCTOS ---
+@app.get("/products")
+def get_products(db: Session = Depends(get_db)):
+    return db.query(ProductDB).filter(ProductDB.is_active == True).all()
+
+@app.post("/products")
+def create_product(product: ProductCreate, db: Session = Depends(get_db)):
+    db_product = ProductDB(**product.dict())
+    db.add(db_product)
+    db.commit()
+    db.refresh(db_product)
+    return db_product
+
+@app.delete("/products/{product_id}")
+def delete_product(product_id: int, db: Session = Depends(get_db)):
+    product = db.query(ProductDB).filter(ProductDB.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    product.is_active = False
+    db.commit()
+    return {"status": "success"}

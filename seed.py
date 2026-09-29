@@ -1,27 +1,32 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from database import engine
+import hashlib
+from database import SessionLocal, engine
 import models
-from seed import init_db
 
-# Crear tablas e inicializar datos base
-models.Base.metadata.create_all(bind=engine)
-init_db()
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
 
-app = FastAPI(title="Fiambreria Backend API", version="1.0.0")
+def init_db():
+    models.Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    
+    admin_user = db.query(models.User).filter(models.User.email == "admin@fiambreria.com").first()
+    
+    if not admin_user:
+        hashed_pw = hash_password("admin123")
+        super_admin = models.User(
+            email="admin@fiambreria.com",
+            hashed_password=hashed_pw,
+            full_name="Super Admin",
+            role="superadmin",
+            is_active=True
+        )
+        db.add(super_admin)
+        db.commit()
+        print("--> Usuario SuperAdmin creado exitosamente.")
+    else:
+        print("--> El usuario SuperAdmin ya existe.")
+    
+    db.close()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "Backend de Fiambreria activo y listo con BD"}
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
+if __name__ == "__main__":
+    init_db()

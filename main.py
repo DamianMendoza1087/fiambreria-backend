@@ -35,6 +35,13 @@ class ProductDB(Base):
     barcode = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
 
+class SaleDB(Base):
+    __tablename__ = "sales"
+    id = Column(Integer, primary_key=True, index=True)
+    total_amount = Column(Float, nullable=False)
+    payment_method = Column(String, default="Efectivo") # Efectivo / Mercado Pago
+    user_id = Column(Integer, nullable=True)
+
 Base.metadata.create_all(bind=engine)
 
 # --- INICIALIZACIÓN FASTAPI ---
@@ -90,6 +97,15 @@ class UserCreate(BaseModel):
     email: str
     password: str
     role: str
+
+class SaleItem(BaseModel):
+    product_id: int
+    quantity: float
+
+class SaleCreate(BaseModel):
+    total_amount: float
+    payment_method: str
+    items: List[SaleItem]
 
 # --- ENDPOINTS AUTH Y USUARIOS ---
 @app.post("/login")
@@ -149,3 +165,17 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
     product.is_active = False
     db.commit()
     return {"status": "success"}
+
+# --- ENDPOINT VENTAS ---
+@app.post("/sales")
+def create_sale(sale_data: SaleCreate, db: Session = Depends(get_db)):
+    new_sale = SaleDB(total_amount=sale_data.total_amount, payment_method=sale_data.payment_method)
+    db.add(new_sale)
+    
+    for item in sale_data.items:
+        prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
+        if prod:
+            prod.stock -= item.quantity
+            
+    db.commit()
+    return {"status": "success", "message": "Venta registrada y stock descontado"}

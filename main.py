@@ -34,6 +34,8 @@ class ProductDB(Base):
     price_per_unit = Column(Float, nullable=False)
     unit_type = Column(String, default="unid")
     stock = Column(Float, default=0.0)
+    last_counted_qty = Column(Float, nullable=True)
+    last_counted_by = Column(String, nullable=True)
     barcode = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
 
@@ -97,6 +99,10 @@ def init_db():
 
 init_db()
 
+class AuditSchema(BaseModel):
+    counted_qty: float
+    reported_by: str
+
 class PermissionsSchema(BaseModel):
     is_active: Optional[bool] = None
     can_preventa: Optional[bool] = None
@@ -141,7 +147,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         "can_preventa": user.can_preventa,
         "can_caja": user.can_caja,
         "can_stock": user.can_stock,
-        "can_ingreso": getattr(user, 'can_ingreso', True)
+        "can_ingreso": user.can_ingreso
     }
 
 @app.get("/users")
@@ -196,6 +202,16 @@ def update_product(product_id: int, prod: ProductCreateSchema, db: Session = Dep
     p.unit_type = prod.unit_type; p.stock = prod.stock; p.barcode = prod.barcode
     db.commit(); db.refresh(p)
     return p
+
+@app.post("/products/{product_id}/audit")
+def audit_product_stock(product_id: int, audit: AuditSchema, db: Session = Depends(get_db)):
+    p = db.query(ProductDB).filter(ProductDB.id == product_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    p.last_counted_qty = audit.counted_qty
+    p.last_counted_by = audit.reported_by
+    db.commit()
+    return {"status": "ok", "message": "Conteo físico guardado"}
 
 @app.delete("/products/{product_id}")
 def delete_product(product_id: int, db: Session = Depends(get_db)):

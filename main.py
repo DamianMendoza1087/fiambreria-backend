@@ -24,6 +24,7 @@ class UserDB(Base):
     can_preventa = Column(Boolean, default=True)
     can_caja = Column(Boolean, default=False)
     can_stock = Column(Boolean, default=False)
+    can_ingreso = Column(Boolean, default=False)
 
 class ProductDB(Base):
     __tablename__ = "products"
@@ -88,7 +89,8 @@ def init_db():
             is_active=True,
             can_preventa=True,
             can_caja=True,
-            can_stock=True
+            can_stock=True,
+            can_ingreso=True
         ))
         db.commit()
     db.close()
@@ -100,6 +102,7 @@ class PermissionsSchema(BaseModel):
     can_preventa: Optional[bool] = None
     can_caja: Optional[bool] = None
     can_stock: Optional[bool] = None
+    can_ingreso: Optional[bool] = None
 
 class ItemSchema(BaseModel):
     product_id: int
@@ -137,7 +140,8 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         "is_active": user.is_active,
         "can_preventa": user.can_preventa,
         "can_caja": user.can_caja,
-        "can_stock": user.can_stock
+        "can_stock": user.can_stock,
+        "can_ingreso": getattr(user, 'can_ingreso', True)
     }
 
 @app.get("/users")
@@ -154,7 +158,8 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
         is_active=False,
         can_preventa=True,
         can_caja=False,
-        can_stock=False
+        can_stock=False,
+        can_ingreso=False
     )
     db.add(new_u); db.commit(); db.refresh(new_u)
     return new_u
@@ -168,6 +173,7 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
     if p.can_preventa is not None: u.can_preventa = p.can_preventa
     if p.can_caja is not None: u.can_caja = p.can_caja
     if p.can_stock is not None: u.can_stock = p.can_stock
+    if p.can_ingreso is not None: u.can_ingreso = p.can_ingreso
     db.commit(); db.refresh(u)
     return u
 

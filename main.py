@@ -1,119 +1,56 @@
-from typing import List
 from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from pydantic import BaseModel
+from typing import List, Optional
 
-from database import engine, get_db
-import models
-import schemas
-from seed import init_db
-from auth import verify_password, create_access_token, get_current_user
+Base = declarative_base()
 
-# Crear tablas e inicializar datos base
-models.Base.metadata.create_all(bind=engine)
-init_db()
+# Modelo de Usuario en BD
+class UserDB(Base):
+    __tablename__ = "users"
 
-app = FastAPI(title="Fiambreria Backend API", version="1.0.0")
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, default="vendedor") # superadmin, dueno, encargado, vendedor, cajero, auditor
+    is_active = Column(Boolean, default=True)
+    is_cashier_active = Column(Boolean, default=False) # Solo uno puede estar True a la vez
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Esqueva Pydantic para creación de usuario
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str
 
-# --- RUTAS DE AUTENTICACIÓN Y SISTEMA ---
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    role: str
+    is_active: bool
+    is_cashier_active: bool
 
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "Backend de Fiambreria activo y listo con BD"}
+    class Config:
+        orm_mode = True
 
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
-
-@app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Correo o contraseña incorrectos"
-        )
+# Endpoint para crear usuario (Solo administrado por Superadmin / Dueño)
+# Lógica para Habilitar Cajero Único
+@app.patch("/users/{user_id}/activate-cashier", response_model=UserResponse)
+def set_active_cashier(user_id: int, db: Session = Depends(get_db)):
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
     
-    access_token = create_access_token(data={"sub": user.email, "role": user.role})
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "user": {
-            "email": user.email,
-            "full_name": user.full_name,
-            "role": user.role
-        }
-    }
-
-@app.get("/me")
-def read_users_me(current_user: models.User = Depends(get_current_user)):
-    return {
-        "email": current_user.email,
-        "full_name": current_user.full_name,
-        "role": current_user.role,
-        "is_active": current_user.is_active
-    }
-
-# --- RUTAS DE PRODUCTOS ---
-
-@app.get("/products", response_model=List[schemas.ProductResponse])
-def get_products(db: Session = Depends(get_db)):
-    """Obtener todos los productos activos"""
-    return db.query(models.Product).filter(models.Product.is_active == True).all()
-
-@app.post("/products", response_model=schemas.ProductResponse, status_code=status.HTTP_201_CREATED)
-def create_product(
-    product: schemas.ProductCreate, 
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    """Crear un producto nuevo (requiere estar autenticado)"""
-    new_product = models.Product(**product.model_dump())
-    db.add(new_product)
-    db.commit()
-    db.refresh(new_product)
-    return new_product
-
-@app.put("/products/{product_id}", response_model=schemas.ProductResponse)
-def update_product(
-    product_id: int, 
-    product_data: schemas.ProductUpdate, 
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    """Actualizar un producto existente (requiere estar autenticado)"""
-    product_query = db.query(models.Product).filter(models.Product.id == product_id)
-    existing_product = product_query.first()
+    # Desactivar a todos los demás cajeros activos
+    db.query(UserDB).update({UserDB.is_cashier_active: False})
     
-    if not existing_product:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-        
-    update_data = product_data.model_dump(exclude_unset=True)
-    product_query.update(update_data)
+    # Activar al usuario seleccionado
+    user.is_cashier_active = True
+    user.is_active = True
     db.commit()
-    db.refresh(existing_product)
-    return existing_product
-
-@app.delete("/products/{product_id}")
-def delete_product(
-    product_id: int, 
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    """Desactivar/eliminar producto (requiere estar autenticado)"""
-    product = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-        
-    product.is_active = False
-    db.commit()
-    return {"message": f"Producto '{product.name}' desactivado con éxito"}
+    db.refresh(user)
+    return user

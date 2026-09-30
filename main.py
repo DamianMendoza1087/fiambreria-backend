@@ -42,6 +42,7 @@ class ProductDB(Base):
     name = Column(String, nullable=False)
     category = Column(String, default="Fiambres")
     cost_price = Column(Float, default=0.0)
+    previous_cost_price = Column(Float, default=0.0)
     price_per_unit = Column(Float, nullable=False)
     supplier = Column(String, nullable=True)
     unit_type = Column(String, default="unid")
@@ -50,7 +51,6 @@ class ProductDB(Base):
     last_counted_by = Column(String, nullable=True)
     barcode = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
-    min_margin_percent = Column(Float, default=30.0)  # Margen deseado mínimo %
     lots = relationship("ProductLotDB", back_populates="product", cascade="all, delete-orphan")
 
 class ProductLotDB(Base):
@@ -62,7 +62,7 @@ class ProductLotDB(Base):
     cost_price = Column(Float, default=0.0)
     initial_qty = Column(Float, default=0.0)
     current_qty = Column(Float, default=0.0)
-    expiration_date = Column(String, nullable=True)  # YYYY-MM-DD
+    expiration_date = Column(String, nullable=True)  # Se almacena internamente en AAAA-MM-DD
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     product = relationship("ProductDB", back_populates="lots")
 
@@ -135,6 +135,29 @@ def get_db():
     finally:
         db.close()
 
+def parse_date_to_iso(date_str: str) -> Optional[str]:
+    """Soporta entrada DD-MM-AAAA o AAAA-MM-DD y retorna formato AAAA-MM-DD."""
+    if not date_str:
+        return None
+    clean_str = date_str.strip().replace('/', '-')
+    parts = clean_str.split('-')
+    if len(parts) == 3:
+        if len(parts[0]) == 2 and len(parts[2]) == 4:
+            # Entrada en DD-MM-AAAA -> reordenar a AAAA-MM-DD
+            return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
+        elif len(parts[0]) == 4 and len(parts[2]) == 2:
+            return f"{parts[0]}-{parts[1].zfill(2)}-{parts[2].zfill(2)}"
+    return clean_str
+
+def format_iso_to_ddmmyyyy(iso_str: str) -> str:
+    """Convierte AAAA-MM-DD a DD-MM-AAAA para visualización."""
+    if not iso_str:
+        return ""
+    parts = iso_str.split('-')
+    if len(parts) == 3 and len(parts[0]) == 4:
+        return f"{parts[2]}-{parts[1]}-{parts[0]}"
+    return iso_str
+
 def init_db():
     db = SessionLocal()
     admin = db.query(UserDB).filter(UserDB.email == "admin@fiambreria.com").first()
@@ -193,9 +216,8 @@ class ProductCreateSchema(BaseModel):
     stock: float
     barcode: Optional[str] = None
     is_active: Optional[bool] = True
-    expiration_date: Optional[str] = None  # YYYY-MM-DD para ingreso por lote
+    expiration_date: Optional[str] = None  # Puede venir como DD-MM-AAAA
     lot_number: Optional[str] = None
-    min_margin_percent: Optional[float] = 30.0
 
 class CashOpenSchema(BaseModel):
     initial_amount: float
@@ -357,37 +379,38 @@ def get_products(db: Session = Depends(get_db)):
 
 @app.post("/products")
 def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db)):
-    # Buscar si ya existe por nombre o EAN
     existing = None
     if prod.barcode:
         existing = db.query(ProductDB).filter(ProductDB.barcode == prod.barcode).first()
     if not existing:
         existing = db.query(ProductDB).filter(ProductDB.name == prod.name).first()
 
+    iso_expiration = parse_date_to_iso(prod.expiration_date)
+
     if existing:
-        # Sumar stock al producto principal y actualizar su último costo registrado
+        existing.previous_cost_price = existing.cost_price or 0.0
         existing.stock += prod.stock
         existing.cost_price = prod.cost_price or existing.cost_price
         existing.supplier = prod.supplier or existing.supplier
+        existing.price_per_unit = prod.price_per_unit or existing.price_per_unit
         existing.is_active = True
         p_target = existing
     else:
         p_target = ProductDB(
             name=prod.name,
             category=prod.category,
-            cost_price=prod.cost_price,
+            cost_price=prod.cost_price or 0.0,
+            previous_cost_price=prod.cost_price or 0.0,
             price_per_unit=prod.price_per_unit,
             supplier=prod.supplier,
             unit_type=prod.unit_type,
             stock=prod.stock,
             barcode=prod.barcode,
-            is_active=True,
-            min_margin_percent=prod.min_margin_percent or 30.0
+            is_active=True
         )
         db.add(p_target); db.flush()
 
-    # Si se especificó fecha de vencimiento, crear el lote correspondiente
-    if prod.expiration_date:
+    if iso_expiration:
         lot = ProductLotDB(
             product_id=p_target.id,
             lot_number=prod.lot_number or f"LOTE-{datetime.date.today().strftime('%Y%m%d')}",
@@ -395,7 +418,7 @@ def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db)):
             cost_price=prod.cost_price or 0.0,
             initial_qty=prod.stock,
             current_qty=prod.stock,
-            expiration_date=prod.expiration_date
+            expiration_date=iso_expiration
         )
         db.add(lot)
 
@@ -407,23 +430,36 @@ def update_product(product_id: int, prod: ProductCreateSchema, db: Session = Dep
     p = db.query(ProductDB).filter(ProductDB.id == product_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
+    
+    if prod.cost_price and prod.cost_price != p.cost_price:
+        p.previous_cost_price = p.cost_price
+        p.cost_price = prod.cost_price
+
     p.name = prod.name
     p.category = prod.category
-    p.cost_price = prod.cost_price
     p.price_per_unit = prod.price_per_unit
     p.supplier = prod.supplier
     p.unit_type = prod.unit_type
     p.stock = prod.stock
     p.barcode = prod.barcode
     p.is_active = prod.is_active if prod.is_active is not None else p.is_active
-    if prod.min_margin_percent: p.min_margin_percent = prod.min_margin_percent
     
     db.commit(); db.refresh(p)
     return p
 
 @app.get("/products/{product_id}/lots")
 def get_product_lots(product_id: int, db: Session = Depends(get_db)):
-    return db.query(ProductLotDB).filter(ProductLotDB.product_id == product_id, ProductLotDB.current_qty > 0).order_by(ProductLotDB.expiration_date.asc()).all()
+    lots = db.query(ProductLotDB).filter(ProductLotDB.product_id == product_id, ProductLotDB.current_qty > 0).order_by(ProductLotDB.expiration_date.asc()).all()
+    res = []
+    for l in lots:
+        res.append({
+            "id": l.id,
+            "lot_number": l.lot_number,
+            "supplier": l.supplier,
+            "current_qty": l.current_qty,
+            "expiration_date": format_iso_to_ddmmyyyy(l.expiration_date)
+        })
+    return res
 
 @app.post("/products/{product_id}/audit")
 def audit_product_stock(product_id: int, audit: AuditSchema, db: Session = Depends(get_db)):
@@ -536,7 +572,7 @@ def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
         if prod:
             prod.stock = max(0.0, prod.stock - item.quantity)
             
-            # DESCUENTO POR FEFO (Consumir stock de lotes con vencimiento más próximo)
+            # DESCUENTO POR FEFO
             remaining_to_discount = item.quantity
             lots = db.query(ProductLotDB).filter(
                 ProductLotDB.product_id == prod.id,
@@ -682,9 +718,8 @@ def get_mrp_suggestions(days: int = 7, target_days: int = 3, db: Session = Depen
 def get_system_alerts(db: Session = Depends(get_db)):
     alerts = []
     today = datetime.date.today()
-    in_30_days = today + datetime.timedelta(days=30)
 
-    # 1. ALERTAS DE VENCIMIENTO (FEFO)
+    # 1. ALERTAS DE VENCIMIENTO (FEFO) - Solo productos ACTIVOS
     active_lots = db.query(ProductLotDB).join(ProductDB).filter(
         ProductDB.is_active == True,
         ProductLotDB.current_qty > 0,
@@ -695,6 +730,7 @@ def get_system_alerts(db: Session = Depends(get_db)):
         try:
             exp_date = datetime.datetime.strptime(lot.expiration_date, "%Y-%m-%d").date()
             days_left = (exp_date - today).days
+            display_date = format_iso_to_ddmmyyyy(lot.expiration_date)
 
             if days_left < 0:
                 alerts.append({
@@ -702,7 +738,7 @@ def get_system_alerts(db: Session = Depends(get_db)):
                     "type": "EXPIRATION",
                     "level": "CRITICAL",
                     "title": f"🚨 Lote Vencido: {lot.product.name}",
-                    "detail": f"Quedan {lot.current_qty} {lot.product.unit_type} vencidas el {lot.expiration_date}. Proveedor: {lot.supplier or 'N/A'}"
+                    "detail": f"Quedan {lot.current_qty} {lot.product.unit_type} vencidas el {display_date}. Proveedor: {lot.supplier or 'N/A'}"
                 })
             elif days_left <= 30:
                 alerts.append({
@@ -710,7 +746,7 @@ def get_system_alerts(db: Session = Depends(get_db)):
                     "type": "EXPIRATION",
                     "level": "WARNING",
                     "title": f"⏳ Vencimiento Próximo ({days_left} días): {lot.product.name}",
-                    "detail": f"Lote de {lot.current_qty} {lot.product.unit_type} vence el {lot.expiration_date}. Proveedor: {lot.supplier or 'N/A'}"
+                    "detail": f"Lote de {lot.current_qty} {lot.product.unit_type} vence el {display_date}. Proveedor: {lot.supplier or 'N/A'}"
                 })
         except Exception:
             pass
@@ -735,17 +771,28 @@ def get_system_alerts(db: Session = Depends(get_db)):
                 "detail": f"Quedan únicamente {p.stock} {p.unit_type} en inventario."
             })
 
-    # 3. ALERTAS DE PRECIO BAJO DE VENTA / MARGEN INSUFICIENTE
+    # 3. ALERTA DE PRECIO DE VENTA BAJO COMPARADO AL COSTO O INGRESO ANTERIOR
     for p in active_products:
-        if p.cost_price > 0 and p.price_per_unit > 0:
-            current_margin = ((p.price_per_unit - p.cost_price) / p.price_per_unit) * 100.0
-            if current_margin < p.min_margin_percent:
+        if p.cost_price > 0:
+            # Aumento de costo sin ajustar PVP
+            if p.price_per_unit <= p.cost_price:
                 alerts.append({
-                    "id": f"margin-{p.id}",
+                    "id": f"price-{p.id}",
                     "type": "PRICE",
-                    "level": "HIGH",
-                    "title": f"💸 Margen Bajo de Venta: {p.name}",
-                    "detail": f"Costo actual ${p.cost_price} vs Venta ${p.price_per_unit}. Margen actual {current_margin:.1f}% (Mínimo configurado: {p.min_margin_percent}%)."
+                    "level": "CRITICAL",
+                    "title": f"💸 Precio de Venta Bajo / Pérdida: {p.name}",
+                    "detail": f"El costo actual (${p.cost_price}) es igual o mayor al precio de venta al público (${p.price_per_unit}). ¡Revisar urgente!"
                 })
+            elif p.previous_cost_price > 0 and p.cost_price > p.previous_cost_price:
+                old_margin = ((p.price_per_unit - p.previous_cost_price) / p.price_per_unit) * 100.0
+                new_margin = ((p.price_per_unit - p.cost_price) / p.price_per_unit) * 100.0
+                if new_margin < (old_margin - 5.0): # Caída significativa en el margen histórico
+                    alerts.append({
+                        "id": f"price-increase-{p.id}",
+                        "type": "PRICE",
+                        "level": "HIGH",
+                        "title": f"⚠️ Aumento de Costo no Trasladado: {p.name}",
+                        "detail": f"El costo subió de ${p.previous_cost_price} a ${p.cost_price}. El margen bajó de {old_margin:.1f}% a {new_margin:.1f}%. Considerar actualizar el PVP (${p.price_per_unit})."
+                    })
 
     return alerts

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, Date
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel
@@ -20,11 +20,21 @@ class UserDB(Base):
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
     role = Column(String, default="vendedor")
-    is_active = Column(Boolean, default=True)
+    is_active = Column(Boolean, default=False)
     can_preventa = Column(Boolean, default=True)
     can_caja = Column(Boolean, default=False)
     can_stock = Column(Boolean, default=False)
     can_ingreso = Column(Boolean, default=False)
+
+class WorkLogDB(Base):
+    __tablename__ = "work_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    user_name = Column(String)
+    user_email = Column(String)
+    clock_in = Column(DateTime, default=datetime.datetime.utcnow)
+    clock_out = Column(DateTime, nullable=True)
+    hours_worked = Column(Float, default=0.0)
 
 class ProductDB(Base):
     __tablename__ = "products"
@@ -47,6 +57,7 @@ class PreSaleDB(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     status = Column(String, default="PENDIENTE")
     total_amount = Column(Float, default=0.0)
+    created_by = Column(String, nullable=True)
     items = relationship("PreSaleItemDB", back_populates="presale", cascade="all, delete-orphan")
 
 class PreSaleItemDB(Base):
@@ -70,11 +81,21 @@ class SaleDB(Base):
     amount_cash = Column(Float, default=0.0)
     amount_mp = Column(Float, default=0.0)
     payment_method = Column(String, default="Efectivo")
+    sold_by = Column(String, nullable=True)
+    items = relationship("SaleItemDB", back_populates="sale", cascade="all, delete-orphan")
+
+class SaleItemDB(Base):
+    __tablename__ = "sale_items"
+    id = Column(Integer, primary_key=True, index=True)
+    sale_id = Column(Integer, ForeignKey("sales.id"))
+    product_id = Column(Integer, ForeignKey("products.id"))
+    quantity = Column(Float, default=0.0)
+    sale = relationship("SaleDB", back_populates="items")
 
 class CashSessionDB(Base):
     __tablename__ = "cash_sessions"
     id = Column(Integer, primary_key=True, index=True)
-    date = Column(String, nullable=False) # YYYY-MM-DD
+    date = Column(String, nullable=False)
     opened_at = Column(DateTime, default=datetime.datetime.utcnow)
     opened_by = Column(String, nullable=False)
     initial_amount = Column(Float, default=0.0)
@@ -89,7 +110,7 @@ class CashSessionDB(Base):
 
 Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Fiambrería POS API")
+app = FastAPI(title="Fiambrería POS, RRHH & MRP API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 def get_db():
@@ -136,6 +157,7 @@ class ItemSchema(BaseModel):
 
 class PreSaleCreateSchema(BaseModel):
     items: List[ItemSchema]
+    created_by: Optional[str] = "Anonimo"
 
 class FinalizeSaleSchema(BaseModel):
     presale_id: Optional[int] = None
@@ -144,6 +166,7 @@ class FinalizeSaleSchema(BaseModel):
     amount_cash: float
     amount_mp: float
     payment_method: str
+    sold_by: Optional[str] = "Anonimo"
 
 class ProductCreateSchema(BaseModel):
     name: str
@@ -206,13 +229,110 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
     u = db.query(UserDB).filter(UserDB.id == user_id).first()
     if not u:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    if p.is_active is not None: u.is_active = p.is_active
+    
+    if p.is_active is not None and p.is_active != u.is_active:
+        u.is_active = p.is_active
+        now = datetime.datetime.utcnow()
+        if p.is_active:
+            db.add(WorkLogDB(user_id=u.id, user_name=u.name, user_email=u.email, clock_in=now))
+        else:
+            log = db.query(WorkLogDB).filter(WorkLogDB.user_id == u.id, WorkLogDB.clock_out == None).order_by(WorkLogDB.id.desc()).first()
+            if log:
+                log.clock_out = now
+                diff_seconds = (now - log.clock_in).total_seconds()
+                log.hours_worked = round(diff_seconds / 3600.0, 2)
+
     if p.can_preventa is not None: u.can_preventa = p.can_preventa
     if p.can_caja is not None: u.can_caja = p.can_caja
     if p.can_stock is not None: u.can_stock = p.can_stock
     if p.can_ingreso is not None: u.can_ingreso = p.can_ingreso
+    
     db.commit(); db.refresh(u)
     return u
+
+@app.get("/hr/worklogs")
+def get_worklogs(db: Session = Depends(get_db)):
+    logs = db.query(WorkLogDB).order_by(WorkLogDB.id.desc()).all()
+    result = []
+    for l in logs:
+        result.append({
+            "id": l.id,
+            "user_name": l.user_name,
+            "user_email": l.user_email,
+            "date": l.clock_in.strftime("%Y-%m-%d"),
+            "clock_in": l.clock_in.strftime("%H:%M hs"),
+            "clock_out": l.clock_out.strftime("%H:%M hs") if l.clock_out else "En jornada",
+            "hours_worked": l.hours_worked
+        })
+    return result
+
+def get_employee_stats(email: str, days: int, db: Session):
+    since_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    sales = db.query(SaleDB).filter(SaleDB.sold_by == email, SaleDB.created_at >= since_date).all()
+    
+    total_revenue = sum(s.total_amount for s in sales)
+    sales_count = len(sales)
+    ticket_avg = round(total_revenue / max(1, sales_count), 2)
+    
+    cash_sessions = db.query(CashSessionDB).filter(CashSessionDB.closed_by == email, CashSessionDB.closed_at >= since_date).all()
+    cash_shifts_count = len(cash_sessions)
+    total_cash_diff = round(sum(cs.difference or 0.0 for cs in cash_sessions), 2)
+
+    work_logs = db.query(WorkLogDB).filter(WorkLogDB.user_email == email, WorkLogDB.clock_in >= since_date).all()
+    total_hours = round(sum(w.hours_worked for w in work_logs), 2)
+
+    return {
+        "email": email,
+        "sales_count": sales_count,
+        "total_revenue": round(total_revenue, 2),
+        "ticket_avg": ticket_avg,
+        "cash_shifts_count": cash_shifts_count,
+        "total_cash_diff": total_cash_diff,
+        "total_hours": total_hours
+    }
+
+@app.get("/hr/performance")
+def get_performance(email: str, days: int = 30, db: Session = Depends(get_db)):
+    return get_employee_stats(email, days, db)
+
+@app.get("/hr/compare")
+def compare_employees(email1: str, email2: str, days: int = 30, db: Session = Depends(get_db)):
+    emp1 = db.query(UserDB).filter(UserDB.email == email1).first()
+    emp2 = db.query(UserDB).filter(UserDB.email == email2).first()
+
+    stats1 = get_employee_stats(email1, days, db)
+    stats2 = get_employee_stats(email2, days, db)
+
+    stats1["name"] = emp1.name if emp1 else email1
+    stats2["name"] = emp2.name if emp2 else email2
+
+    # Algoritmo de Diagnóstico Comparativo
+    diagnosis = []
+    if stats1["total_revenue"] > stats2["total_revenue"]:
+        diff = round(stats1["total_revenue"] - stats2["total_revenue"], 2)
+        diagnosis.append(f"• {stats1['name']} generó ${diff} más en ventas totales que {stats2['name']}.")
+    elif stats2["total_revenue"] > stats1["total_revenue"]:
+        diff = round(stats2["total_revenue"] - stats1["total_revenue"], 2)
+        diagnosis.append(f"• {stats2['name']} generó ${diff} más en ventas totales que {stats1['name']}.")
+    else:
+        diagnosis.append("• Ambos empleados registraron el mismo nivel de facturación.")
+
+    if stats1["ticket_avg"] > stats2["ticket_avg"]:
+        diagnosis.append(f"• {stats1['name']} logró un ticket promedio mayor (${stats1['ticket_avg']} vs ${stats2['ticket_avg']}).")
+    elif stats2["ticket_avg"] > stats1["ticket_avg"]:
+        diagnosis.append(f"• {stats2['name']} logró un ticket promedio mayor (${stats2['ticket_avg']} vs ${stats1['ticket_avg']}).")
+
+    if abs(stats1["total_cash_diff"]) < abs(stats2["total_cash_diff"]):
+        diagnosis.append(f"• {stats1['name']} presentó mayor precisión en los cierres de caja (menor margen de error).")
+    elif abs(stats2["total_cash_diff"]) < abs(stats1["total_cash_diff"]):
+        diagnosis.append(f"• {stats2['name']} presentó mayor precisión en los cierres de caja (menor margen de error).")
+
+    return {
+        "days": days,
+        "emp1": stats1,
+        "emp2": stats2,
+        "diagnosis": diagnosis
+    }
 
 @app.get("/products")
 def get_products(db: Session = Depends(get_db)):
@@ -259,7 +379,7 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
 @app.post("/presales")
 def create_presale(payload: PreSaleCreateSchema, db: Session = Depends(get_db)):
     total = 0.0
-    presale = PreSaleDB(status="PENDIENTE")
+    presale = PreSaleDB(status="PENDIENTE", created_by=payload.created_by)
     db.add(presale); db.flush()
 
     for item in payload.items:
@@ -298,7 +418,6 @@ def delete_presale(presale_id: int, db: Session = Depends(get_db)):
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="No encontrada")
 
-# GESTIÓN DE CAJA Y ARQUEO
 @app.get("/cash/status")
 def get_cash_status(db: Session = Depends(get_db)):
     active_session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
@@ -341,14 +460,17 @@ def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
         total_amount=payload.total_amount,
         amount_cash=payload.amount_cash,
         amount_mp=payload.amount_mp,
-        payment_method=payload.payment_method
+        payment_method=payload.payment_method,
+        sold_by=payload.sold_by
     )
     db.add(sale)
+    db.flush()
 
     for item in payload.items:
         prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
         if prod:
             prod.stock = max(0.0, prod.stock - item.quantity)
+            db.add(SaleItemDB(sale_id=sale.id, product_id=prod.id, quantity=item.quantity))
 
     if payload.presale_id:
         ps = db.query(PreSaleDB).filter(PreSaleDB.id == payload.presale_id).first()
@@ -371,14 +493,12 @@ def close_cash(payload: CashCloseSchema, db: Session = Depends(get_db)):
     expected_cash = session.initial_amount + total_cash_sales
     diff = payload.reported_cash - expected_cash
 
-    # 1er Intento: Validación estricta a ciegas
     if payload.attempt_number == 1 and abs(diff) > 0.01:
         return {
             "status": "mismatch_first_attempt",
             "message": "⚠️ Monto incorrecto. Por favor volvé a contar el dinero e ingresá la cifra nuevamente."
         }
 
-    # 2do Intento o Coincidencia Exacta: Cierre definitivo
     session.is_open = False
     session.closed_at = datetime.datetime.utcnow()
     session.closed_by = payload.closed_by
@@ -426,3 +546,50 @@ def get_cash_audits(date: Optional[str] = None, db: Session = Depends(get_db)):
             "total_sales_count": len(sales)
         })
     return result
+
+@app.get("/mrp/suggestions")
+def get_mrp_suggestions(days: int = 7, target_days: int = 3, db: Session = Depends(get_db)):
+    since_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+    sales = db.query(SaleDB).filter(SaleDB.created_at >= since_date).all()
+    
+    sales_by_prod = {}
+    for s in sales:
+        for item in s.items:
+            sales_by_prod[item.product_id] = sales_by_prod.get(item.product_id, 0.0) + item.quantity
+
+    products = db.query(ProductDB).filter(ProductDB.is_active == True).all()
+    suggestions = []
+
+    for p in products:
+        total_sold = sales_by_prod.get(p.id, 0.0)
+        daily_demand = total_sold / max(1, days)
+        
+        if total_sold <= 0:
+            continue
+
+        stock_target = daily_demand * target_days
+        suggested_buy = max(0.0, stock_target - p.stock)
+
+        status = "OK"
+        if p.stock <= 0:
+            status = "AGOTADO"
+        elif p.stock < (daily_demand * 1):
+            status = "CRÍTICO"
+        elif suggested_buy > 0:
+            status = "REPOSICIÓN RECOMENDADA"
+
+        suggestions.append({
+            "product_id": p.id,
+            "product_name": p.name,
+            "supplier": p.supplier or "Sin Proveedor",
+            "current_stock": p.stock,
+            "unit_type": p.unit_type,
+            "total_sold_period": round(total_sold, 2),
+            "daily_demand": round(daily_demand, 2),
+            "target_days": target_days,
+            "suggested_buy": round(suggested_buy, 2),
+            "estimated_cost": round(suggested_buy * (p.cost_price or 0.0), 2),
+            "status": status
+        })
+
+    return sorted(suggestions, key=lambda x: x["suggested_buy"], reverse=True)

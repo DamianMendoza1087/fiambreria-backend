@@ -1144,23 +1144,87 @@ def get_product_lots(product_id:int,branch_id: int = 1,db:Session=Depends(get_db
     return [{"id":l.id,"lot_number":l.lot_number,"supplier":l.supplier,"cost_price":l.cost_price,"initial_qty":l.initial_qty,"current_qty":l.current_qty,"expiration_date":format_iso_to_ddmmyyyy(l.expiration_date)} for l in lots]
 
 @app.post("/products/{product_id}/audit")
-def audit_product_stock(product_id:int,audit:AuditSchema,db:Session=Depends(get_db)):
-    x=db.query(ProductDB).filter(ProductDB.id==product_id).first()
-    if not x: raise HTTPException(status_code=404,detail="Producto no encontrado")
-    if audit.counted_qty<0: raise HTTPException(status_code=422,detail="Conteo negativo")
-    old=x.stock or 0; diff=audit.counted_qty-old
-    x.last_counted_qty=audit.counted_qty; x.last_counted_by=audit.reported_by
-    if diff>0.000001:
-        lot=ProductLotDB(product_id=x.id,lot_number=f"AJUSTE-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}",supplier=x.supplier,cost_price=x.cost_price or 0,initial_qty=diff,current_qty=diff,expiration_date=None)
-        db.add(lot); db.flush(); x.stock=audit.counted_qty
-        db.add(StockMovementDB(product_id=x.id,lot_id=lot.id,movement_type="ADJUSTMENT",quantity=diff,unit_cost=x.cost_price or 0,reason="Sobrante por conteo fisico",actor=audit.reported_by))
+def audit_product_stock(
+    product_id: int,
+    audit: AuditSchema,
+    branch_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    x = db.query(ProductDB).filter(ProductDB.id == product_id).first()
+
+    if not x:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+
+    if audit.counted_qty < 0:
+        raise HTTPException(status_code=422, detail="Conteo negativo")
+
+    # El stock real se calcula exclusivamente con los lotes de esta sucursal.
+    old = get_branch_stock(db, product_id, branch_id)
+    diff = audit.counted_qty - old
+
+    x.last_counted_qty = audit.counted_qty
+    x.last_counted_by = audit.reported_by
+
+    if diff > 0.000001:
+        lot = ProductLotDB(
+            branch_id=branch_id,
+            product_id=x.id,
+            lot_number=f"AJUSTE-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+            supplier=x.supplier,
+            cost_price=x.cost_price or 0,
+            initial_qty=diff,
+            current_qty=diff,
+            expiration_date=None
+        )
+
+        db.add(lot)
+        db.flush()
+
+        db.add(StockMovementDB(
+            branch_id=branch_id,
+            product_id=x.id,
+            lot_id=lot.id,
+            movement_type="ADJUSTMENT",
+            quantity=diff,
+            unit_cost=x.cost_price or 0,
+            reason="Sobrante por conteo fisico",
+            actor=audit.reported_by
+        ))
+
     elif diff < -0.000001:
-        consume_stock_fefo(x,-diff,"ADJUSTMENT",audit.reported_by,"Faltante por conteo fisico",db)
-    if abs(diff)>0.000001:
-        db.add(AuditEventDB(entity_type="product",entity_id=x.id,field_name="stock",old_value=str(old),new_value=str(audit.counted_qty),actor=audit.reported_by,reason="Conteo fisico"))
+        consume_stock_fefo(
+            x,
+            -diff,
+            "ADJUSTMENT",
+            audit.reported_by,
+            "Faltante por conteo fisico",
+            db,
+            branch_id=branch_id
+        )
+
+    if abs(diff) > 0.000001:
+        db.add(AuditEventDB(
+            entity_type="product",
+            entity_id=x.id,
+            field_name=f"stock_branch_{branch_id}",
+            old_value=str(old),
+            new_value=str(audit.counted_qty),
+            actor=audit.reported_by,
+            reason="Conteo fisico"
+        ))
+
     db.commit()
-    lot_sum=sum(float(v or 0) for (v,) in db.query(ProductLotDB.current_qty).filter(ProductLotDB.product_id==x.id).all())
-    return {"status":"ok","difference":diff,"stock":x.stock,"lots_stock":round(lot_sum,6)}
+
+    branch_stock = get_branch_stock(db, product_id, branch_id)
+
+    return {
+        "status": "ok",
+        "branch_id": branch_id,
+        "difference": round(diff, 6),
+        "stock": round(branch_stock, 6),
+        "lots_stock": round(branch_stock, 6)
+    }
+
 
 @app.delete("/products/{product_id}")
 def delete_product(product_id:int,db:Session=Depends(get_db)):

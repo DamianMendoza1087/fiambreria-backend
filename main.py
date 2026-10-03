@@ -41,6 +41,7 @@ class WorkLogDB(Base):
     clock_in = Column(DateTime, default=datetime.datetime.utcnow)
     clock_out = Column(DateTime, nullable=True)
     hours_worked = Column(Float, default=0.0)
+    role_worked = Column(String, nullable=True)
 
 class ProductDB(Base):
     __tablename__ = "products"
@@ -228,6 +229,11 @@ def ensure_v2_schema():
             if column_name not in existing:
                 conn.execute(text(f"ALTER TABLE products ADD COLUMN {column_name} {ddl}"))
 
+    work_cols={c["name"] for c in inspector.get_columns("work_logs")}
+    if "role_worked" not in work_cols:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE work_logs ADD COLUMN role_worked VARCHAR"))
+
     sale_cols={c["name"] for c in inspector.get_columns("sale_items")}
     sale_additions={"unit_price":"FLOAT DEFAULT 0","unit_cost":"FLOAT DEFAULT 0","cogs":"FLOAT DEFAULT 0","gross_profit":"FLOAT DEFAULT 0"}
     with engine.begin() as conn:
@@ -398,6 +404,16 @@ class ReplenishmentPolicySchema(BaseModel):
     actor: Optional[str] = "Anonimo"
     reason: Optional[str] = None
 
+class ShiftStartSchema(BaseModel):
+    user_id: int
+    role_worked: Optional[str] = None
+
+class ShiftEndSchema(BaseModel):
+    user_id: int
+
+class UserStatusSchema(BaseModel):
+    is_active: bool
+
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     user = db.query(UserDB).filter(UserDB.email == form_data.username).first()
@@ -442,40 +458,31 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
 
 @app.patch("/users/{user_id}/permissions")
 def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends(get_db)):
-    u = db.query(UserDB).filter(UserDB.id == user_id).first()
-    if not u:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    
+    u=db.query(UserDB).filter(UserDB.id==user_id).first()
+    if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
     if p.role is not None:
-        u.role = p.role
-        if p.role == "superadmin":
-            u.can_edit_records = True
+        u.role=p.role
+        if p.role=="superadmin": u.can_edit_records=True
+    if p.is_active is not None: u.is_active=p.is_active
+    if p.can_preventa is not None: u.can_preventa=p.can_preventa
+    if p.can_caja is not None: u.can_caja=p.can_caja
+    if p.can_stock is not None: u.can_stock=p.can_stock
+    if p.can_ingreso is not None: u.can_ingreso=p.can_ingreso
+    if p.can_alertas is not None: u.can_alertas=p.can_alertas
+    if p.can_rrhh is not None: u.can_rrhh=p.can_rrhh
+    if p.can_mrp is not None: u.can_mrp=p.can_mrp
+    if p.can_verificacion is not None: u.can_verificacion=p.can_verificacion
+    if p.can_kpis is not None: u.can_kpis=p.can_kpis
+    if p.can_edit_records is not None: u.can_edit_records=p.can_edit_records
+    db.commit(); db.refresh(u); return u
 
-    if p.is_active is not None and p.is_active != u.is_active:
-        u.is_active = p.is_active
-        now = datetime.datetime.utcnow()
-        if p.is_active:
-            db.add(WorkLogDB(user_id=u.id, user_name=u.name, user_email=u.email, clock_in=now))
-        else:
-            log = db.query(WorkLogDB).filter(WorkLogDB.user_id == u.id, WorkLogDB.clock_out == None).order_by(WorkLogDB.id.desc()).first()
-            if log:
-                log.clock_out = now
-                diff_seconds = (now - log.clock_in).total_seconds()
-                log.hours_worked = round(diff_seconds / 3600.0, 2)
-
-    if p.can_preventa is not None: u.can_preventa = p.can_preventa
-    if p.can_caja is not None: u.can_caja = p.can_caja
-    if p.can_stock is not None: u.can_stock = p.can_stock
-    if p.can_ingreso is not None: u.can_ingreso = p.can_ingreso
-    if p.can_alertas is not None: u.can_alertas = p.can_alertas
-    if p.can_rrhh is not None: u.can_rrhh = p.can_rrhh
-    if p.can_mrp is not None: u.can_mrp = p.can_mrp
-    if p.can_verificacion is not None: u.can_verificacion = p.can_verificacion
-    if p.can_kpis is not None: u.can_kpis = p.can_kpis
-    if p.can_edit_records is not None: u.can_edit_records = p.can_edit_records
-    
-    db.commit(); db.refresh(u)
-    return u
+@app.patch("/users/{user_id}/status")
+def update_user_status(user_id: int, payload: UserStatusSchema, db: Session=Depends(get_db)):
+    u=db.query(UserDB).filter(UserDB.id==user_id).first()
+    if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
+    u.is_active=payload.is_active
+    db.commit()
+    return {"status":"success","user_id":u.id,"is_active":u.is_active}
 
 @app.get("/kpis/dashboard")
 def get_kpis_dashboard(db: Session = Depends(get_db)):
@@ -539,78 +546,68 @@ def get_kpis_dashboard(db: Session = Depends(get_db)):
         "top_staff": top_staff
     }
 
+@app.post("/hr/shifts/start")
+def start_shift(payload: ShiftStartSchema, db: Session=Depends(get_db)):
+    user=db.query(UserDB).filter(UserDB.id==payload.user_id).first()
+    if not user: raise HTTPException(status_code=404,detail="Empleado no encontrado")
+    if not user.is_active: raise HTTPException(status_code=403,detail="El usuario esta inhabilitado")
+    current=db.query(WorkLogDB).filter(WorkLogDB.user_id==user.id,WorkLogDB.clock_out==None).order_by(WorkLogDB.id.desc()).first()
+    if current: raise HTTPException(status_code=409,detail="El empleado ya tiene un turno abierto")
+    log=WorkLogDB(user_id=user.id,user_name=user.name,user_email=user.email,clock_in=datetime.datetime.utcnow(),role_worked=payload.role_worked or user.role)
+    db.add(log); db.commit(); db.refresh(log)
+    return {"status":"success","shift_id":log.id,"user_id":user.id,"role_worked":log.role_worked}
+
+@app.post("/hr/shifts/end")
+def end_shift(payload: ShiftEndSchema, db: Session=Depends(get_db)):
+    log=db.query(WorkLogDB).filter(WorkLogDB.user_id==payload.user_id,WorkLogDB.clock_out==None).order_by(WorkLogDB.id.desc()).first()
+    if not log: raise HTTPException(status_code=404,detail="No hay turno abierto para ese empleado")
+    now=datetime.datetime.utcnow(); log.clock_out=now
+    log.hours_worked=round((now-log.clock_in).total_seconds()/3600.0,2)
+    db.commit()
+    return {"status":"success","shift_id":log.id,"hours_worked":log.hours_worked}
+
+@app.get("/hr/shifts/active")
+def active_shifts(db: Session=Depends(get_db)):
+    return db.query(WorkLogDB).filter(WorkLogDB.clock_out==None).order_by(WorkLogDB.clock_in.asc()).all()
+
 @app.get("/hr/worklogs")
-def get_worklogs(db: Session = Depends(get_db)):
-    logs = db.query(WorkLogDB).order_by(WorkLogDB.id.desc()).all()
-    result = []
-    for l in logs:
-        result.append({
-            "id": l.id,
-            "user_name": l.user_name,
-            "user_email": l.user_email,
-            "date": l.clock_in.strftime("%Y-%m-%d"),
-            "clock_in": l.clock_in.strftime("%H:%M hs"),
-            "clock_out": l.clock_out.strftime("%H:%M hs") if l.clock_out else "En jornada",
-            "hours_worked": l.hours_worked
-        })
-    return result
+def get_worklogs(email: Optional[str]=None, days: Optional[int]=None, db: Session=Depends(get_db)):
+    q=db.query(WorkLogDB)
+    if email: q=q.filter(WorkLogDB.user_email==email)
+    if days and days>0: q=q.filter(WorkLogDB.clock_in>=datetime.datetime.utcnow()-datetime.timedelta(days=days))
+    logs=q.order_by(WorkLogDB.id.desc()).all()
+    return [{"id":l.id,"user_id":l.user_id,"user_name":l.user_name,"user_email":l.user_email,"role_worked":l.role_worked,"date":l.clock_in.strftime("%Y-%m-%d"),"clock_in":l.clock_in.strftime("%H:%M hs"),"clock_out":l.clock_out.strftime("%H:%M hs") if l.clock_out else "En jornada","hours_worked":l.hours_worked} for l in logs]
 
 def get_employee_stats(email: str, days: int, db: Session):
-    since_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
-    sales = db.query(SaleDB).filter(SaleDB.sold_by == email, SaleDB.created_at >= since_date).all()
-    
-    total_revenue = sum(s.total_amount for s in sales)
-    sales_count = len(sales)
-    ticket_avg = round(total_revenue / max(1, sales_count), 2)
-    
-    cash_sessions = db.query(CashSessionDB).filter(CashSessionDB.closed_by == email, CashSessionDB.closed_at >= since_date).all()
-    cash_shifts_count = len(cash_sessions)
-    total_cash_diff = round(sum(cs.difference or 0.0 for cs in cash_sessions), 2)
-
-    work_logs = db.query(WorkLogDB).filter(WorkLogDB.user_email == email, WorkLogDB.clock_in >= since_date).all()
-    total_hours = round(sum(w.hours_worked for w in work_logs), 2)
-
-    return {
-        "email": email,
-        "sales_count": sales_count,
-        "total_revenue": round(total_revenue, 2),
-        "ticket_avg": ticket_avg,
-        "cash_shifts_count": cash_shifts_count,
-        "total_cash_diff": total_cash_diff,
-        "total_hours": total_hours
-    }
+    since=datetime.datetime.utcnow()-datetime.timedelta(days=max(1,days))
+    user=db.query(UserDB).filter(UserDB.email==email).first()
+    sales=db.query(SaleDB).filter(SaleDB.sold_by==email,SaleDB.created_at>=since).all()
+    revenue=sum(x.total_amount for x in sales)
+    work=db.query(WorkLogDB).filter(WorkLogDB.user_email==email,WorkLogDB.clock_in>=since).all()
+    now=datetime.datetime.utcnow(); hours=0.0; roles={}
+    for w in work:
+        end=w.clock_out or now
+        hours+=(w.hours_worked if w.clock_out else (end-w.clock_in).total_seconds()/3600.0)
+        role=w.role_worked or (user.role if user else "sin_rol")
+        roles[role]=roles.get(role,0)+1
+    cash_ops=db.query(CashMovementDB).filter(CashMovementDB.actor==email,CashMovementDB.created_at>=since).count()
+    presales=db.query(PreSaleDB).filter(PreSaleDB.created_by==email,PreSaleDB.created_at>=since).count()
+    losses=db.query(StockMovementDB).filter(StockMovementDB.actor==email,StockMovementDB.movement_type=="LOSS",StockMovementDB.created_at>=since).count()
+    return {"email":email,"name":user.name if user else email,"account_enabled":user.is_active if user else None,"current_role":user.role if user else None,"roles_worked":roles,"days":days,"shifts_count":len(work),"total_hours":round(hours,2),"sales_count":len(sales),"total_revenue":round(revenue,2),"ticket_avg":round(revenue/max(1,len(sales)),2),"presales_count":presales,"cash_operations":cash_ops,"stock_loss_operations":losses}
 
 @app.get("/hr/performance")
-def get_performance(email: str, days: int = 30, db: Session = Depends(get_db)):
-    return get_employee_stats(email, days, db)
+def get_performance(email: str, days: int=30, db: Session=Depends(get_db)):
+    return get_employee_stats(email,days,db)
 
 @app.get("/hr/compare")
-def compare_employees(email1: str, email2: str, days: int = 30, db: Session = Depends(get_db)):
-    emp1 = db.query(UserDB).filter(UserDB.email == email1).first()
-    emp2 = db.query(UserDB).filter(UserDB.email == email2).first()
-
-    stats1 = get_employee_stats(email1, days, db)
-    stats2 = get_employee_stats(email2, days, db)
-
-    stats1["name"] = emp1.name if emp1 else email1
-    stats2["name"] = emp2.name if emp2 else email2
-
-    diagnosis = []
-    if stats1["total_revenue"] > stats2["total_revenue"]:
-        diff = round(stats1["total_revenue"] - stats2["total_revenue"], 2)
-        diagnosis.append(f"• {stats1['name']} generó ${diff} más en ventas que {stats2['name']}.")
-    elif stats2["total_revenue"] > stats1["total_revenue"]:
-        diff = round(stats2["total_revenue"] - stats1["total_revenue"], 2)
-        diagnosis.append(f"• {stats2['name']} generó ${diff} más en ventas que {stats1['name']}.")
-    else:
-        diagnosis.append("• Ambos registraron igual nivel de facturación.")
-
-    return {
-        "days": days,
-        "emp1": stats1,
-        "emp2": stats2,
-        "diagnosis": diagnosis
-    }
+def compare_employees(emails: str="", days: int=30, db: Session=Depends(get_db), email1: Optional[str]=None, email2: Optional[str]=None):
+    selected=[x.strip() for x in emails.split(",") if x.strip()]
+    if not selected: selected=[x for x in (email1,email2) if x]
+    if not selected: selected=[u.email for u in db.query(UserDB).order_by(UserDB.name.asc()).all()]
+    unique=[]
+    for email in selected:
+        if email not in unique: unique.append(email)
+    return {"days":days,"count":len(unique),"employees":[get_employee_stats(email,days,db) for email in unique]}
 
 @app.get("/products")
 def get_products(db: Session = Depends(get_db)):

@@ -33,6 +33,24 @@ class UserDB(Base):
     can_kpis = Column(Boolean, default=False)
     can_edit_records = Column(Boolean, default=False)  # Controla si el dueño/usuario puede editar/eliminar registros
 
+class BranchDB(Base):
+    __tablename__ = "branches"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    code = Column(String, nullable=False, unique=True, index=True)
+    is_active = Column(Boolean, default=True)
+
+
+class BranchProductDB(Base):
+    __tablename__ = "branch_products"
+    id = Column(Integer, primary_key=True, index=True)
+    branch_id = Column(Integer, ForeignKey("branches.id"), nullable=False, index=True)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
+    price_per_unit = Column(Float, nullable=True)
+    is_available = Column(Boolean, default=True)
+    is_exclusive = Column(Boolean, default=False)
+
+
 class WorkLogDB(Base):
     __tablename__ = "work_logs"
     id = Column(Integer, primary_key=True, index=True)
@@ -66,6 +84,7 @@ class ProductDB(Base):
 
 class ProductLotDB(Base):
     __tablename__ = "product_lots"
+    branch_id = Column(Integer, default=1, index=True)
     id = Column(Integer, primary_key=True, index=True)
     product_id = Column(Integer, ForeignKey("products.id"))
     lot_number = Column(String, nullable=True)
@@ -79,6 +98,7 @@ class ProductLotDB(Base):
 
 class ProductIngressDB(Base):
     __tablename__ = "product_ingresses"
+    branch_id = Column(Integer, default=1, index=True)
     id = Column(Integer, primary_key=True, index=True)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
     supplier = Column(String, nullable=True)
@@ -92,6 +112,7 @@ class ProductIngressDB(Base):
 
 class StockMovementDB(Base):
     __tablename__ = "stock_movements"
+    branch_id = Column(Integer, default=1, index=True)
     id = Column(Integer, primary_key=True, index=True)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
     lot_id = Column(Integer, ForeignKey("product_lots.id"), nullable=True)
@@ -129,6 +150,7 @@ class PriceHistoryDB(Base):
 
 class CashMovementDB(Base):
     __tablename__ = "cash_movements"
+    branch_id = Column(Integer, default=1, index=True)
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(Integer, ForeignKey("cash_sessions.id"), nullable=True, index=True)
     movement_type = Column(String, nullable=False)
@@ -153,6 +175,7 @@ class AlertStateDB(Base):
 
 class PreSaleDB(Base):
     __tablename__ = "presales"
+    branch_id = Column(Integer, default=1, index=True)
     id = Column(Integer, primary_key=True, index=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     status = Column(String, default="PENDIENTE")
@@ -173,6 +196,7 @@ class PreSaleItemDB(Base):
 
 class SaleDB(Base):
     __tablename__ = "sales"
+    branch_id = Column(Integer, default=1, index=True)
     id = Column(Integer, primary_key=True, index=True)
     presale_id = Column(Integer, nullable=True)
     session_id = Column(Integer, nullable=True)
@@ -199,6 +223,7 @@ class SaleItemDB(Base):
 
 class CashSessionDB(Base):
     __tablename__ = "cash_sessions"
+    branch_id = Column(Integer, default=1, index=True)
     id = Column(Integer, primary_key=True, index=True)
     date = Column(String, nullable=False)
     opened_at = Column(DateTime, default=datetime.datetime.utcnow)
@@ -243,6 +268,60 @@ def ensure_v2_schema():
                 conn.execute(text(f"ALTER TABLE sale_items ADD COLUMN {column_name} {ddl}"))
 
 ensure_v2_schema()
+
+
+
+def ensure_multilocal_schema():
+    Base.metadata.create_all(bind=engine)
+
+    tables = [
+        "product_lots",
+        "product_ingresses",
+        "stock_movements",
+        "cash_movements",
+        "presales",
+        "sales",
+        "cash_sessions",
+    ]
+
+    with engine.begin() as conn:
+        for table_name in tables:
+            cols = {
+                c["name"]
+                for c in inspect(engine).get_columns(table_name)
+            }
+
+            if "branch_id" not in cols:
+                conn.execute(text(
+                    f"ALTER TABLE {table_name} "
+                    "ADD COLUMN branch_id INTEGER DEFAULT 1"
+                ))
+
+            conn.execute(text(
+                f"UPDATE {table_name} "
+                "SET branch_id=1 WHERE branch_id IS NULL"
+            ))
+
+        if not conn.execute(
+            text("SELECT id FROM branches WHERE id=1")
+        ).fetchone():
+            conn.execute(text(
+                "INSERT INTO branches "
+                "(id,name,code,is_active) VALUES "
+                "(1,'Fiambrería Local','FIAMBRERIA',1)"
+            ))
+
+        if not conn.execute(
+            text("SELECT id FROM branches WHERE id=2")
+        ).fetchone():
+            conn.execute(text(
+                "INSERT INTO branches "
+                "(id,name,code,is_active) VALUES "
+                "(2,'Feria Damyale','FERIA',1)"
+            ))
+
+
+ensure_multilocal_schema()
 
 
 app = FastAPI(title="Fiambrería POS, RRHH, MRP, KPIs & Permisos API")
@@ -866,7 +945,7 @@ def create_presale(payload: PreSaleCreateSchema, db: Session = Depends(get_db)):
                 unit_type=prod.unit_type,
                 quantity=item.quantity
             ))
-    
+
     presale.total_amount = total
     db.commit()
     return {"status": "success", "presale_id": presale.id, "total": total}
@@ -917,8 +996,8 @@ def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, 
     return total_cost
 
 @app.get("/cash/status")
-def get_cash_status(db: Session = Depends(get_db)):
-    active_session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
+def get_cash_status(branch_id: int = 1, db: Session = Depends(get_db)):
+    active_session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True, CashSessionDB.branch_id == branch_id).first()
     if not active_session:
         return {"is_open": False}
     return {
@@ -930,13 +1009,13 @@ def get_cash_status(db: Session = Depends(get_db)):
     }
 
 @app.post("/cash/open")
-def open_cash(payload: CashOpenSchema, db: Session = Depends(get_db)):
-    active = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
+def open_cash(payload: CashOpenSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+    active = db.query(CashSessionDB).filter(CashSessionDB.is_open == True, CashSessionDB.branch_id == branch_id).first()
     if active:
         raise HTTPException(status_code=400, detail="La caja ya se encuentra abierta")
-    
+
     today_str = ar_now().date().strftime("%Y-%m-%d")
-    session = CashSessionDB(
+    session = CashSessionDB(branch_id=branch_id,
         date=today_str,
         opened_by=payload.opened_by,
         initial_amount=payload.initial_amount,
@@ -976,20 +1055,20 @@ def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
     return {"status":"success","message":"Venta procesada","sale_id":sale.id}
 
 @app.post("/cash/movements")
-def create_cash_movement(payload: CashMovementCreateSchema, db: Session = Depends(get_db)):
+def create_cash_movement(payload: CashMovementCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):
     if payload.amount<=0:
         raise HTTPException(status_code=422, detail="Monto invalido")
     movement=payload.movement_type.upper()
     if movement not in ("IN","OUT"):
         raise HTTPException(status_code=422, detail="movement_type debe ser IN u OUT")
     active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True).first()
-    row=CashMovementDB(session_id=active.id if active else None, movement_type=movement, category=payload.category.upper(), amount=payload.amount, concept=payload.concept, actor=payload.actor, supplier=payload.supplier, employee_email=payload.employee_email, notes=payload.notes)
+    row=CashMovementDB(branch_id=branch_id, session_id=active.id if active else None, movement_type=movement, category=payload.category.upper(), amount=payload.amount, concept=payload.concept, actor=payload.actor, supplier=payload.supplier, employee_email=payload.employee_email, notes=payload.notes)
     db.add(row); db.commit(); db.refresh(row)
     return row
 
 @app.get("/cash/movements")
-def list_cash_movements(session_id: Optional[int]=None, db: Session=Depends(get_db)):
-    q=db.query(CashMovementDB)
+def list_cash_movements(session_id: Optional[int]=None, branch_id: int = 1, db: Session=Depends(get_db)):
+    q=db.query(CashMovementDB).filter(CashMovementDB.branch_id == branch_id)
     if session_id is not None:
         q=q.filter(CashMovementDB.session_id==session_id)
     return q.order_by(CashMovementDB.id.desc()).limit(500).all()
@@ -1009,15 +1088,15 @@ def create_stock_loss(payload: StockLossSchema, db: Session=Depends(get_db)):
     return {"status":"success","product_id":x.id,"quantity":payload.quantity,"economic_loss":round(cost,2),"reason":reason,"stock":x.stock}
 
 @app.post("/cash/close")
-def close_cash(payload: CashCloseSchema, db: Session = Depends(get_db)):
-    session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
+def close_cash(payload: CashCloseSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+    session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True, CashSessionDB.branch_id == branch_id).first()
     if not session:
         raise HTTPException(status_code=400, detail="No hay una caja abierta para cerrar")
 
     sales = db.query(SaleDB).filter(SaleDB.session_id == session.id).all()
     total_cash_sales = sum(s.amount_cash for s in sales)
     total_mp_sales = sum(s.amount_mp for s in sales)
-    
+
     movements=db.query(CashMovementDB).filter(CashMovementDB.session_id==session.id).all()
     cash_in=sum(m.amount for m in movements if m.movement_type=="IN")
     cash_out=sum(m.amount for m in movements if m.movement_type=="OUT")
@@ -1055,7 +1134,7 @@ def get_cash_audits(date: Optional[str] = None, db: Session = Depends(get_db)):
     query = db.query(CashSessionDB)
     if date:
         query = query.filter(CashSessionDB.date == date)
-    
+
     sessions = query.order_by(CashSessionDB.id.desc()).all()
     result = []
     for s in sessions:

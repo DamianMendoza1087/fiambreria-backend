@@ -340,8 +340,8 @@ class ProductCreateSchema(BaseModel):
     expiration_date: Optional[str] = None
     lot_number: Optional[str] = None
     brand: Optional[str] = None
-    requires_expiration: Optional[bool] = False
-    replenishment_policy: Optional[str] = "MRP"
+    requires_expiration: Optional[bool] = None
+    replenishment_policy: Optional[str] = None
     received_by: Optional[str] = "Anonimo"
     notes: Optional[str] = None
 
@@ -413,6 +413,15 @@ class ShiftEndSchema(BaseModel):
 
 class UserStatusSchema(BaseModel):
     is_active: bool
+
+class IngressCorrectionSchema(BaseModel):
+    supplier: Optional[str] = None
+    cost_price: Optional[float] = None
+    quantity: Optional[float] = None
+    lot_number: Optional[str] = None
+    expiration_date: Optional[str] = None
+    actor: str
+    reason: str
 
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -709,6 +718,45 @@ def get_ingresses(product_id: Optional[int]=None, db: Session=Depends(get_db)):
     if product_id is not None: q=q.filter(ProductIngressDB.product_id==product_id)
     return q.order_by(ProductIngressDB.id.desc()).limit(200).all()
 
+@app.patch("/ingresses/{ingress_id}")
+def correct_ingress(ingress_id: int, payload: IngressCorrectionSchema, db: Session=Depends(get_db)):
+    if not payload.reason.strip(): raise HTTPException(status_code=422,detail="El motivo de la correccion es obligatorio")
+    ing=db.query(ProductIngressDB).filter(ProductIngressDB.id==ingress_id).first()
+    if not ing: raise HTTPException(status_code=404,detail="Ingreso no encontrado")
+    product=db.query(ProductDB).filter(ProductDB.id==ing.product_id).first()
+    movement=db.query(StockMovementDB).filter(StockMovementDB.reference_type=="product_ingress",StockMovementDB.reference_id==ing.id).order_by(StockMovementDB.id.asc()).first()
+    lot=db.query(ProductLotDB).filter(ProductLotDB.id==movement.lot_id).first() if movement and movement.lot_id else None
+    if not product or not lot: raise HTTPException(status_code=409,detail="El ingreso no tiene lote trazable y no puede corregirse automaticamente")
+    changes=[]
+    def audit(field,old,new):
+        if old!=new:
+            changes.append((field,old,new))
+            db.add(AuditEventDB(entity_type="product_ingress",entity_id=ing.id,field_name=field,old_value=str(old),new_value=str(new),actor=payload.actor,reason=payload.reason))
+    if payload.quantity is not None:
+        if payload.quantity<=0: raise HTTPException(status_code=422,detail="La cantidad debe ser mayor a cero")
+        diff=payload.quantity-ing.quantity
+        if lot.current_qty+diff < -0.000001 or (product.stock or 0)+diff < -0.000001: raise HTTPException(status_code=409,detail="No se puede reducir el ingreso: parte de ese stock ya fue consumido")
+        audit("quantity",ing.quantity,payload.quantity)
+        if abs(diff)>0.000001:
+            lot.initial_qty+=diff; lot.current_qty+=diff; product.stock=(product.stock or 0)+diff
+            db.add(StockMovementDB(product_id=product.id,lot_id=lot.id,movement_type="ADJUSTMENT",quantity=diff,unit_cost=lot.cost_price or 0,reason=f"Correccion ingreso #{ing.id}",actor=payload.actor,reference_type="product_ingress_correction",reference_id=ing.id,notes=payload.reason))
+            ing.quantity=payload.quantity
+    if payload.cost_price is not None:
+        if payload.cost_price<0: raise HTTPException(status_code=422,detail="El costo no puede ser negativo")
+        audit("cost_price",ing.cost_price,payload.cost_price); ing.cost_price=payload.cost_price; lot.cost_price=payload.cost_price
+        if movement: movement.unit_cost=payload.cost_price
+        latest=db.query(ProductIngressDB).filter(ProductIngressDB.product_id==product.id).order_by(ProductIngressDB.received_at.desc(),ProductIngressDB.id.desc()).first()
+        if latest and latest.id==ing.id: product.previous_cost_price=product.cost_price or 0; product.cost_price=payload.cost_price
+    if payload.supplier is not None: audit("supplier",ing.supplier,payload.supplier); ing.supplier=payload.supplier; lot.supplier=payload.supplier
+    if payload.lot_number is not None: audit("lot_number",ing.lot_number,payload.lot_number); ing.lot_number=payload.lot_number; lot.lot_number=payload.lot_number
+    if payload.expiration_date is not None:
+        new_exp=parse_date_to_iso(payload.expiration_date)
+        if product.requires_expiration and not new_exp: raise HTTPException(status_code=422,detail="Este producto requiere vencimiento")
+        audit("expiration_date",ing.expiration_date,new_exp); ing.expiration_date=new_exp; lot.expiration_date=new_exp
+    if not changes: return {"status":"no_changes","ingress_id":ing.id}
+    db.commit()
+    return {"status":"success","ingress_id":ing.id,"product_id":product.id,"lot_id":lot.id,"stock":product.stock,"changes":[{"field":f,"old":o,"new":n} for f,o,n in changes]}
+
 @app.get("/stock/movements")
 def get_stock_movements(product_id: Optional[int]=None, db: Session=Depends(get_db)):
     q=db.query(StockMovementDB)
@@ -729,7 +777,8 @@ def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db)):
         existing.name=prod.name.strip(); existing.category=prod.category or existing.category
         existing.brand=prod.brand if prod.brand is not None else existing.brand
         existing.price_per_unit=prod.price_per_unit; existing.unit_type=prod.unit_type or existing.unit_type
-        existing.requires_expiration=bool(prod.requires_expiration); existing.replenishment_policy=prod.replenishment_policy or "MRP"
+        if prod.requires_expiration is not None: existing.requires_expiration=prod.requires_expiration
+        if prod.replenishment_policy is not None: existing.replenishment_policy=prod.replenishment_policy
         target=existing
     else:
         target=ProductDB(name=prod.name.strip(),category=prod.category or "Varios",brand=prod.brand,cost_price=0,previous_cost_price=0,price_per_unit=prod.price_per_unit,supplier=prod.supplier,unit_type=prod.unit_type or "unid",stock=0,barcode=barcode,requires_expiration=bool(prod.requires_expiration),replenishment_policy=prod.replenishment_policy or "MRP",is_active=True)
@@ -745,9 +794,11 @@ def update_product(product_id:int, prod:ProductCreateSchema, db:Session=Depends(
     if barcode and db.query(ProductDB).filter(ProductDB.barcode==barcode,ProductDB.id!=product_id).first():
         raise HTTPException(status_code=409,detail="EAN ya asociado a otro producto")
     old_price=x.price_per_unit
-    changes={"name":(x.name,prod.name.strip()),"category":(x.category,prod.category),"brand":(x.brand,prod.brand),"price_per_unit":(x.price_per_unit,prod.price_per_unit),"supplier":(x.supplier,prod.supplier),"unit_type":(x.unit_type,prod.unit_type),"barcode":(x.barcode,barcode),"requires_expiration":(x.requires_expiration,bool(prod.requires_expiration)),"replenishment_policy":(x.replenishment_policy,prod.replenishment_policy or "MRP")}
+    changes={"name":(x.name,prod.name.strip()),"category":(x.category,prod.category),"brand":(x.brand,prod.brand),"price_per_unit":(x.price_per_unit,prod.price_per_unit),"supplier":(x.supplier,prod.supplier),"unit_type":(x.unit_type,prod.unit_type),"barcode":(x.barcode,barcode),"requires_expiration":(x.requires_expiration,prod.requires_expiration if prod.requires_expiration is not None else x.requires_expiration),"replenishment_policy":(x.replenishment_policy,prod.replenishment_policy if prod.replenishment_policy is not None else x.replenishment_policy)}
     x.name=prod.name.strip(); x.category=prod.category; x.brand=prod.brand; x.price_per_unit=prod.price_per_unit
-    x.supplier=prod.supplier; x.unit_type=prod.unit_type; x.barcode=barcode; x.requires_expiration=bool(prod.requires_expiration); x.replenishment_policy=prod.replenishment_policy or "MRP"
+    x.supplier=prod.supplier; x.unit_type=prod.unit_type; x.barcode=barcode
+    if prod.requires_expiration is not None: x.requires_expiration=prod.requires_expiration
+    if prod.replenishment_policy is not None: x.replenishment_policy=prod.replenishment_policy
     x.is_active=prod.is_active if prod.is_active is not None else x.is_active
     actor=prod.received_by or "Anonimo"
     for field,(old,new) in changes.items():
@@ -1079,20 +1130,21 @@ def update_alert_state(alert_key: str, payload: AlertActionSchema, db: Session =
     state=db.query(AlertStateDB).filter(AlertStateDB.alert_key==alert_key).first()
     if not state:
         state=AlertStateDB(alert_key=alert_key)
-        db.add(state)
+        db.add(state); db.flush()
+    old_status=state.status or "NEW"
     state.status=status
     state.updated_at=datetime.datetime.utcnow()
     state.resolved_by=payload.actor
     state.resolution_note=payload.note
     state.snoozed_until=(datetime.datetime.utcnow()+datetime.timedelta(hours=max(1,payload.snooze_hours or 24))) if status=="SNOOZED" else None
-    db.add(AuditEventDB(entity_type="alert",entity_id=state.id,field_name="status",old_value=None,new_value=status,actor=payload.actor,reason=payload.note or f"Alerta {status}"))
+    db.add(AuditEventDB(entity_type="alert",entity_id=state.id,field_name="status",old_value=old_status,new_value=status,actor=payload.actor,reason=payload.note or f"Alerta {status}"))
     db.commit(); db.refresh(state)
     return {"status":"success","alert_key":alert_key,"state":state.status,"snoozed_until":state.snoozed_until}
 
 @app.get("/alerts/history")
 def get_alert_history(limit: int = 200, db: Session = Depends(get_db)):
-    states=db.query(AlertStateDB).order_by(AlertStateDB.updated_at.desc()).limit(min(max(limit,1),500)).all()
-    return states
+    rows=db.query(AuditEventDB).filter(AuditEventDB.entity_type=="alert").order_by(AuditEventDB.created_at.desc()).limit(min(max(limit,1),500)).all()
+    return [{"id":x.id,"alert_state_id":x.entity_id,"old_state":x.old_value,"new_state":x.new_value,"actor":x.actor,"note":x.reason,"created_at":x.created_at} for x in rows]
 
 @app.get("/alerts")
 def get_system_alerts(db: Session = Depends(get_db)):

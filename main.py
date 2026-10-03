@@ -766,7 +766,7 @@ def normalize_barcode(value: Optional[str]) -> Optional[str]:
 
 def register_ingress(product: ProductDB, supplier: Optional[str], cost_price: float, quantity: float,
                      lot_number: Optional[str], expiration_date: Optional[str], received_by: Optional[str],
-                     notes: Optional[str], db: Session):
+                     notes: Optional[str], db: Session, branch_id: int = 1):
     if quantity <= 0: raise HTTPException(status_code=422, detail="La cantidad debe ser mayor a cero")
     if cost_price < 0: raise HTTPException(status_code=422, detail="El costo no puede ser negativo")
     iso_exp = parse_date_to_iso(expiration_date)
@@ -777,11 +777,11 @@ def register_ingress(product: ProductDB, supplier: Optional[str], cost_price: fl
     product.supplier = supplier or product.supplier
     product.stock = (product.stock or 0.0) + quantity
     product.is_active = True
-    lot=ProductLotDB(product_id=product.id,lot_number=lot_number or f"LOTE-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}",supplier=supplier,cost_price=cost_price,initial_qty=quantity,current_qty=quantity,expiration_date=iso_exp)
+    lot=ProductLotDB(branch_id=branch_id,product_id=product.id,lot_number=lot_number or f"LOTE-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}",supplier=supplier,cost_price=cost_price,initial_qty=quantity,current_qty=quantity,expiration_date=iso_exp)
     db.add(lot); db.flush()
-    ing=ProductIngressDB(product_id=product.id,supplier=supplier,cost_price=cost_price,quantity=quantity,lot_number=lot.lot_number,expiration_date=iso_exp,received_by=received_by,notes=notes)
+    ing=ProductIngressDB(branch_id=branch_id,product_id=product.id,supplier=supplier,cost_price=cost_price,quantity=quantity,lot_number=lot.lot_number,expiration_date=iso_exp,received_by=received_by,notes=notes)
     db.add(ing); db.flush()
-    db.add(StockMovementDB(product_id=product.id,lot_id=lot.id,movement_type="INGRESS",quantity=quantity,unit_cost=cost_price,reason="Ingreso de mercaderia",actor=received_by,reference_type="product_ingress",reference_id=ing.id,notes=notes))
+    db.add(StockMovementDB(branch_id=branch_id,product_id=product.id,lot_id=lot.id,movement_type="INGRESS",quantity=quantity,unit_cost=cost_price,reason="Ingreso de mercaderia",actor=received_by,reference_type="product_ingress",reference_id=ing.id,notes=notes))
     return ing,lot
 
 @app.post("/products/master")
@@ -795,16 +795,16 @@ def create_product_master(prod: ProductMasterSchema, db: Session = Depends(get_d
     db.add(x); db.commit(); db.refresh(x); return x
 
 @app.post("/ingresses")
-def create_ingress(payload: IngressCreateSchema, db: Session = Depends(get_db)):
+def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):
     product=db.query(ProductDB).filter(ProductDB.id==payload.product_id).first()
     if not product: raise HTTPException(status_code=404,detail="Producto no encontrado")
-    ing,lot=register_ingress(product,payload.supplier,payload.cost_price,payload.quantity,payload.lot_number,payload.expiration_date,payload.received_by,payload.notes,db)
+    ing,lot=register_ingress(product,payload.supplier,payload.cost_price,payload.quantity,payload.lot_number,payload.expiration_date,payload.received_by,payload.notes,db,branch_id)
     db.commit(); db.refresh(ing)
     return {"status":"success","ingress_id":ing.id,"lot_id":lot.id,"product_id":product.id,"stock":product.stock}
 
 @app.get("/ingresses")
-def get_ingresses(product_id: Optional[int]=None, db: Session=Depends(get_db)):
-    q=db.query(ProductIngressDB)
+def get_ingresses(product_id: Optional[int]=None, branch_id: int = 1, db: Session=Depends(get_db)):
+    q=db.query(ProductIngressDB).filter(ProductIngressDB.branch_id==branch_id)
     if product_id is not None: q=q.filter(ProductIngressDB.product_id==product_id)
     return q.order_by(ProductIngressDB.id.desc()).limit(200).all()
 
@@ -897,8 +897,8 @@ def update_product(product_id:int, prod:ProductCreateSchema, db:Session=Depends(
     db.commit(); db.refresh(x); return x
 
 @app.get("/products/{product_id}/lots")
-def get_product_lots(product_id:int,db:Session=Depends(get_db)):
-    lots=db.query(ProductLotDB).filter(ProductLotDB.product_id==product_id,ProductLotDB.current_qty>0).order_by(ProductLotDB.expiration_date.is_(None),ProductLotDB.expiration_date.asc(),ProductLotDB.created_at.asc()).all()
+def get_product_lots(product_id:int,branch_id: int = 1,db:Session=Depends(get_db)):
+    lots=db.query(ProductLotDB).filter(ProductLotDB.product_id==product_id,ProductLotDB.branch_id==branch_id,ProductLotDB.current_qty>0).order_by(ProductLotDB.expiration_date.is_(None),ProductLotDB.expiration_date.asc(),ProductLotDB.created_at.asc()).all()
     return [{"id":l.id,"lot_number":l.lot_number,"supplier":l.supplier,"cost_price":l.cost_price,"initial_qty":l.initial_qty,"current_qty":l.current_qty,"expiration_date":format_iso_to_ddmmyyyy(l.expiration_date)} for l in lots]
 
 @app.post("/products/{product_id}/audit")
@@ -968,14 +968,14 @@ def delete_presale(presale_id: int, db: Session = Depends(get_db)):
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="No encontrada")
 
-def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, actor: str, reason: str, db: Session, reference_type: Optional[str]=None, reference_id: Optional[int]=None, preferred_lot_id: Optional[int]=None):
+def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, actor: str, reason: str, db: Session, reference_type: Optional[str]=None, reference_id: Optional[int]=None, preferred_lot_id: Optional[int]=None, branch_id: int = 1):
     if quantity <= 0:
         raise HTTPException(status_code=422, detail="La cantidad debe ser mayor a cero")
     if (product.stock or 0) + 0.000001 < quantity:
         raise HTTPException(status_code=409, detail=f"Stock insuficiente de {product.name}")
     remaining=quantity
     total_cost=0.0
-    q=db.query(ProductLotDB).filter(ProductLotDB.product_id==product.id, ProductLotDB.current_qty>0)
+    q=db.query(ProductLotDB).filter(ProductLotDB.product_id==product.id, ProductLotDB.branch_id==branch_id, ProductLotDB.current_qty>0)
     lots=q.order_by(ProductLotDB.expiration_date.is_(None), ProductLotDB.expiration_date.asc(), ProductLotDB.created_at.asc()).all()
     if preferred_lot_id is not None:
         lots=sorted(lots, key=lambda x: 0 if x.id==preferred_lot_id else 1)
@@ -987,11 +987,11 @@ def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, 
         remaining-=take
         uc=lot.cost_price or product.cost_price or 0.0
         total_cost+=take*uc
-        db.add(StockMovementDB(product_id=product.id, lot_id=lot.id, movement_type=movement_type, quantity=-take, unit_cost=uc, reason=reason, actor=actor, reference_type=reference_type, reference_id=reference_id))
+        db.add(StockMovementDB(branch_id=branch_id, product_id=product.id, lot_id=lot.id, movement_type=movement_type, quantity=-take, unit_cost=uc, reason=reason, actor=actor, reference_type=reference_type, reference_id=reference_id))
     if remaining > 0.000001:
         uc=product.cost_price or 0.0
         total_cost+=remaining*uc
-        db.add(StockMovementDB(product_id=product.id, movement_type=movement_type, quantity=-remaining, unit_cost=uc, reason=reason, actor=actor, reference_type=reference_type, reference_id=reference_id))
+        db.add(StockMovementDB(branch_id=branch_id, product_id=product.id, movement_type=movement_type, quantity=-remaining, unit_cost=uc, reason=reason, actor=actor, reference_type=reference_type, reference_id=reference_id))
     product.stock=(product.stock or 0)-quantity
     return total_cost
 
@@ -1027,9 +1027,9 @@ def open_cash(payload: CashOpenSchema, branch_id: int = 1, db: Session = Depends
     return {"status": "ok", "session_id": session.id}
 
 @app.post("/sales/finalize")
-def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
-    active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True).first()
-    sale=SaleDB(presale_id=payload.presale_id, session_id=active.id if active else None, total_amount=payload.total_amount, amount_cash=payload.amount_cash, amount_mp=payload.amount_mp, payment_method=payload.payment_method, sold_by=payload.sold_by)
+def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+    active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True,CashSessionDB.branch_id==branch_id).first()
+    sale=SaleDB(branch_id=branch_id,presale_id=payload.presale_id, session_id=active.id if active else None, total_amount=payload.total_amount, amount_cash=payload.amount_cash, amount_mp=payload.amount_mp, payment_method=payload.payment_method, sold_by=payload.sold_by)
     db.add(sale); db.flush()
     products={}
     for item in payload.items:
@@ -1041,7 +1041,7 @@ def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
         products[item.product_id]=x
     for item in payload.items:
         x=products[item.product_id]
-        cost=consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta", db, "sale", sale.id)
+        cost=consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta", db, "sale", sale.id, branch_id=branch_id)
         unit_price=x.price_per_unit or 0
         if payload.presale_id:
             psi=db.query(PreSaleItemDB).filter(PreSaleItemDB.presale_id==payload.presale_id,PreSaleItemDB.product_id==x.id).first()
@@ -1061,7 +1061,7 @@ def create_cash_movement(payload: CashMovementCreateSchema, branch_id: int = 1, 
     movement=payload.movement_type.upper()
     if movement not in ("IN","OUT"):
         raise HTTPException(status_code=422, detail="movement_type debe ser IN u OUT")
-    active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True).first()
+    active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True,CashSessionDB.branch_id==branch_id).first()
     row=CashMovementDB(branch_id=branch_id, session_id=active.id if active else None, movement_type=movement, category=payload.category.upper(), amount=payload.amount, concept=payload.concept, actor=payload.actor, supplier=payload.supplier, employee_email=payload.employee_email, notes=payload.notes)
     db.add(row); db.commit(); db.refresh(row)
     return row

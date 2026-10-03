@@ -1479,8 +1479,14 @@ def close_cash(payload: CashCloseSchema, branch_id: int = 1, db: Session = Depen
     }
 
 @app.get("/cash/audits")
-def get_cash_audits(date: Optional[str] = None, db: Session = Depends(get_db)):
-    query = db.query(CashSessionDB)
+def get_cash_audits(
+    date: Optional[str] = None,
+    branch_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    query = db.query(CashSessionDB).filter(
+        CashSessionDB.branch_id == branch_id
+    )
     if date:
         query = query.filter(CashSessionDB.date == date)
 
@@ -1524,31 +1530,85 @@ def update_replenishment_policy(product_id: int, payload: ReplenishmentPolicySch
     return {"status":"success","product_id":product.id,"policy":policy}
 
 @app.get("/mrp/suggestions")
-def get_mrp_suggestions(days: int = 7, target_days: int = 3, db: Session = Depends(get_db)):
-    since=datetime.datetime.utcnow()-datetime.timedelta(days=days)
-    sales=db.query(SaleDB).filter(SaleDB.created_at>=since).all()
-    sales_by_prod={}
+def get_mrp_suggestions(
+    days: int = 7,
+    target_days: int = 3,
+    branch_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
+
+    sales = db.query(SaleDB).filter(
+        SaleDB.created_at >= since,
+        SaleDB.branch_id == branch_id
+    ).all()
+
+    sales_by_prod = {}
     for sale in sales:
         for item in sale.items:
-            sales_by_prod[item.product_id]=sales_by_prod.get(item.product_id,0.0)+item.quantity
-    suggestions=[]
-    products=db.query(ProductDB).filter(ProductDB.is_active==True).all()
+            sales_by_prod[item.product_id] = (
+                sales_by_prod.get(item.product_id, 0.0) + item.quantity
+            )
+
+    suggestions = []
+
+    products = db.query(ProductDB).filter(
+        ProductDB.is_active == True
+    ).all()
+
     for product in products:
-        policy=(product.replenishment_policy or "MRP").upper()
-        if policy!="MRP":
+        config = db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id == branch_id,
+            BranchProductDB.product_id == product.id,
+            BranchProductDB.is_available == True
+        ).first()
+
+        if not config:
             continue
-        total_sold=sales_by_prod.get(product.id,0.0)
-        if total_sold<=0:
+
+        policy = (product.replenishment_policy or "MRP").upper()
+        if policy != "MRP":
             continue
-        daily=total_sold/max(1,days)
-        target=daily*target_days
-        buy=max(0.0,target-(product.stock or 0))
-        status="OK"
-        if product.stock<=0: status="AGOTADO"
-        elif product.stock<daily: status="CRITICO"
-        elif buy>0: status="REPOSICION_RECOMENDADA"
-        suggestions.append({"product_id":product.id,"product_name":product.name,"supplier":product.supplier or "Sin Proveedor","current_stock":product.stock,"unit_type":product.unit_type,"total_sold_period":round(total_sold,2),"daily_demand":round(daily,2),"target_days":target_days,"suggested_buy":round(buy,2),"estimated_cost":round(buy*(product.cost_price or 0),2),"status":status,"replenishment_policy":policy})
-    return sorted(suggestions,key=lambda x:x["suggested_buy"],reverse=True)
+
+        total_sold = sales_by_prod.get(product.id, 0.0)
+        if total_sold <= 0:
+            continue
+
+        current_stock = get_branch_stock(db, product.id, branch_id)
+        daily = total_sold / max(1, days)
+        target = daily * target_days
+        buy = max(0.0, target - current_stock)
+
+        status = "OK"
+        if current_stock <= 0:
+            status = "AGOTADO"
+        elif current_stock < daily:
+            status = "CRITICO"
+        elif buy > 0:
+            status = "REPOSICION_RECOMENDADA"
+
+        suggestions.append({
+            "product_id": product.id,
+            "product_name": product.name,
+            "supplier": product.supplier or "Sin Proveedor",
+            "current_stock": round(current_stock, 2),
+            "unit_type": product.unit_type,
+            "total_sold_period": round(total_sold, 2),
+            "daily_demand": round(daily, 2),
+            "target_days": target_days,
+            "suggested_buy": round(buy, 2),
+            "estimated_cost": round(
+                buy * (product.cost_price or 0), 2
+            ),
+            "status": status,
+            "replenishment_policy": policy
+        })
+
+    return sorted(
+        suggestions,
+        key=lambda x: x["suggested_buy"],
+        reverse=True
+    )
 
 def alert_is_visible(alert_key: str, db: Session):
     state=db.query(AlertStateDB).filter(AlertStateDB.alert_key==alert_key).first()

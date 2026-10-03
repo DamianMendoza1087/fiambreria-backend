@@ -826,6 +826,30 @@ def get_products(branch_id: int = 1, db: Session = Depends(get_db)):
     return result
 
 
+@app.get("/products/master/by-barcode/{barcode}")
+def get_master_product_by_barcode(
+    barcode: str,
+    db: Session = Depends(get_db)
+):
+    clean = barcode.strip()
+
+    product = db.query(ProductDB).filter(
+        ProductDB.barcode == clean,
+        ProductDB.is_active == True
+    ).first()
+
+    if not product:
+        raise HTTPException(
+            status_code=404,
+            detail="EAN no asociado a ningun producto"
+        )
+
+    return {
+        c.name: getattr(product, c.name)
+        for c in ProductDB.__table__.columns
+    }
+
+
 @app.get("/products/by-barcode/{barcode}")
 def get_product_by_barcode(barcode: str, branch_id: int = 1, db: Session = Depends(get_db)):
     product = db.query(ProductDB).filter(ProductDB.barcode == barcode.strip()).first()
@@ -1027,19 +1051,100 @@ def remove_product_from_branch(
 
 
 @app.post("/products/master")
-def create_product_master(prod: ProductMasterSchema, db: Session = Depends(get_db)):
-    barcode=normalize_barcode(prod.barcode)
-    if barcode and db.query(ProductDB).filter(ProductDB.barcode==barcode).first():
-        raise HTTPException(status_code=409,detail="Ese EAN ya existe")
-    if db.query(ProductDB).filter(func.lower(ProductDB.name)==prod.name.strip().lower()).first():
-        raise HTTPException(status_code=409,detail="Ya existe un producto con ese nombre")
-    x=ProductDB(name=prod.name.strip(),category=prod.category or "Varios",brand=prod.brand,barcode=barcode,price_per_unit=prod.price_per_unit,unit_type=prod.unit_type or "unid",stock=0,cost_price=0,previous_cost_price=0,requires_expiration=prod.requires_expiration,replenishment_policy=prod.replenishment_policy or "MRP",is_active=prod.is_active)
-    db.add(x); db.commit(); db.refresh(x); return x
+def create_product_master(
+    prod: ProductMasterSchema,
+    branch_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    barcode = normalize_barcode(prod.barcode)
+
+    if barcode and db.query(ProductDB).filter(
+        ProductDB.barcode == barcode
+    ).first():
+        raise HTTPException(status_code=409, detail="Ese EAN ya existe")
+
+    if db.query(ProductDB).filter(
+        func.lower(ProductDB.name) == prod.name.strip().lower()
+    ).first():
+        raise HTTPException(
+            status_code=409,
+            detail="Ya existe un producto con ese nombre"
+        )
+
+    branch = db.query(BranchDB).filter(
+        BranchDB.id == branch_id,
+        BranchDB.is_active == True
+    ).first()
+
+    if not branch:
+        raise HTTPException(
+            status_code=404,
+            detail="Sucursal no encontrada"
+        )
+
+    x = ProductDB(
+        name=prod.name.strip(),
+        category=prod.category or "Varios",
+        brand=prod.brand,
+        barcode=barcode,
+        price_per_unit=prod.price_per_unit,
+        unit_type=prod.unit_type or "unid",
+        stock=0,
+        cost_price=0,
+        previous_cost_price=0,
+        requires_expiration=prod.requires_expiration,
+        replenishment_policy=prod.replenishment_policy or "MRP",
+        is_active=prod.is_active
+    )
+
+    db.add(x)
+    db.flush()
+
+    config = BranchProductDB(
+        branch_id=branch_id,
+        product_id=x.id,
+        price_per_unit=prod.price_per_unit,
+        is_available=True,
+        is_exclusive=(branch_id != 1)
+    )
+
+    db.add(config)
+    db.commit()
+    db.refresh(x)
+
+    return x
 
 @app.post("/ingresses")
 def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):
     product=db.query(ProductDB).filter(ProductDB.id==payload.product_id).first()
-    if not product: raise HTTPException(status_code=404,detail="Producto no encontrado")
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+
+    branch = db.query(BranchDB).filter(
+        BranchDB.id == branch_id,
+        BranchDB.is_active == True
+    ).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Sucursal no encontrada")
+
+    config = db.query(BranchProductDB).filter(
+        BranchProductDB.branch_id == branch_id,
+        BranchProductDB.product_id == product.id
+    ).first()
+
+    if not config:
+        config = BranchProductDB(
+            branch_id=branch_id,
+            product_id=product.id,
+            price_per_unit=product.price_per_unit,
+            is_available=True,
+            is_exclusive=False
+        )
+        db.add(config)
+        db.flush()
+    elif not config.is_available:
+        config.is_available = True
+
     ing,lot=register_ingress(product,payload.supplier,payload.cost_price,payload.quantity,payload.lot_number,payload.expiration_date,payload.received_by,payload.notes,db,branch_id)
     db.commit(); db.refresh(ing)
     return {"status":"success","ingress_id":ing.id,"lot_id":lot.id,"product_id":product.id,"stock":product.stock}

@@ -7,6 +7,7 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel
 from typing import List, Optional
 import datetime
+from zoneinfo import ZoneInfo
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./fiambreria.db"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
@@ -253,6 +254,16 @@ def get_db():
         yield db
     finally:
         db.close()
+
+ARG_TZ=ZoneInfo("America/Argentina/Buenos_Aires")
+
+def ar_now():
+    return datetime.datetime.now(ARG_TZ)
+
+def utc_to_ar(value):
+    if not value: return None
+    aware=value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None else value
+    return aware.astimezone(ARG_TZ)
 
 def parse_date_to_iso(date_str: Optional[str]) -> Optional[str]:
     if date_str is None or not str(date_str).strip():
@@ -816,12 +827,19 @@ def audit_product_stock(product_id:int,audit:AuditSchema,db:Session=Depends(get_
     x=db.query(ProductDB).filter(ProductDB.id==product_id).first()
     if not x: raise HTTPException(status_code=404,detail="Producto no encontrado")
     if audit.counted_qty<0: raise HTTPException(status_code=422,detail="Conteo negativo")
-    old=x.stock or 0; diff=audit.counted_qty-old; x.last_counted_qty=audit.counted_qty; x.last_counted_by=audit.reported_by
+    old=x.stock or 0; diff=audit.counted_qty-old
+    x.last_counted_qty=audit.counted_qty; x.last_counted_by=audit.reported_by
+    if diff>0.000001:
+        lot=ProductLotDB(product_id=x.id,lot_number=f"AJUSTE-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}",supplier=x.supplier,cost_price=x.cost_price or 0,initial_qty=diff,current_qty=diff,expiration_date=None)
+        db.add(lot); db.flush(); x.stock=audit.counted_qty
+        db.add(StockMovementDB(product_id=x.id,lot_id=lot.id,movement_type="ADJUSTMENT",quantity=diff,unit_cost=x.cost_price or 0,reason="Sobrante por conteo fisico",actor=audit.reported_by))
+    elif diff < -0.000001:
+        consume_stock_fefo(x,-diff,"ADJUSTMENT",audit.reported_by,"Faltante por conteo fisico",db)
     if abs(diff)>0.000001:
-        x.stock=audit.counted_qty
-        db.add(StockMovementDB(product_id=x.id,movement_type="ADJUSTMENT",quantity=diff,unit_cost=x.cost_price or 0,reason="Ajuste por conteo fisico",actor=audit.reported_by))
         db.add(AuditEventDB(entity_type="product",entity_id=x.id,field_name="stock",old_value=str(old),new_value=str(audit.counted_qty),actor=audit.reported_by,reason="Conteo fisico"))
-    db.commit(); return {"status":"ok","difference":diff,"stock":x.stock}
+    db.commit()
+    lot_sum=sum(float(v or 0) for (v,) in db.query(ProductLotDB.current_qty).filter(ProductLotDB.product_id==x.id).all())
+    return {"status":"ok","difference":diff,"stock":x.stock,"lots_stock":round(lot_sum,6)}
 
 @app.delete("/products/{product_id}")
 def delete_product(product_id:int,db:Session=Depends(get_db)):
@@ -859,7 +877,7 @@ def get_pending_presales(db: Session = Depends(get_db)):
     result = []
     for ps in presales:
         items = [{"product_id": i.product_id, "name": i.product_name, "price_per_unit": i.price_per_unit, "unit_type": i.unit_type, "qty": i.quantity} for i in ps.items]
-        result.append({"id": ps.id, "created_at": ps.created_at.strftime("%H:%M"), "total": ps.total_amount, "items": items})
+        result.append({"id": ps.id, "created_at": utc_to_ar(ps.created_at).strftime("%H:%M"), "total": ps.total_amount, "items": items})
     return result
 
 @app.delete("/presales/{presale_id}")
@@ -907,7 +925,7 @@ def get_cash_status(db: Session = Depends(get_db)):
         "is_open": True,
         "session_id": active_session.id,
         "opened_by": active_session.opened_by,
-        "opened_at": active_session.opened_at.strftime("%H:%M hs"),
+        "opened_at": utc_to_ar(active_session.opened_at).strftime("%H:%M hs"),
         "initial_amount": active_session.initial_amount
     }
 
@@ -917,7 +935,7 @@ def open_cash(payload: CashOpenSchema, db: Session = Depends(get_db)):
     if active:
         raise HTTPException(status_code=400, detail="La caja ya se encuentra abierta")
     
-    today_str = datetime.date.today().strftime("%Y-%m-%d")
+    today_str = ar_now().date().strftime("%Y-%m-%d")
     session = CashSessionDB(
         date=today_str,
         opened_by=payload.opened_by,
@@ -945,8 +963,12 @@ def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
     for item in payload.items:
         x=products[item.product_id]
         cost=consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta", db, "sale", sale.id)
-        revenue=(x.price_per_unit or 0)*item.quantity
-        db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_price=x.price_per_unit or 0, unit_cost=cost/item.quantity, cogs=cost, gross_profit=revenue-cost))
+        unit_price=x.price_per_unit or 0
+        if payload.presale_id:
+            psi=db.query(PreSaleItemDB).filter(PreSaleItemDB.presale_id==payload.presale_id,PreSaleItemDB.product_id==x.id).first()
+            if psi: unit_price=psi.price_per_unit or unit_price
+        revenue=unit_price*item.quantity
+        db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_price=unit_price, unit_cost=cost/item.quantity, cogs=cost, gross_profit=revenue-cost))
     if payload.presale_id:
         ps=db.query(PreSaleDB).filter(PreSaleDB.id==payload.presale_id).first()
         if ps: ps.status="COMPLETADA"
@@ -1041,11 +1063,11 @@ def get_cash_audits(date: Optional[str] = None, db: Session = Depends(get_db)):
         result.append({
             "id": s.id,
             "date": s.date,
-            "opened_at": s.opened_at.strftime("%H:%M hs"),
+            "opened_at": utc_to_ar(s.opened_at).strftime("%H:%M hs"),
             "opened_by": s.opened_by,
             "initial_amount": s.initial_amount,
             "is_open": s.is_open,
-            "closed_at": s.closed_at.strftime("%H:%M hs") if s.closed_at else "En curso",
+            "closed_at": utc_to_ar(s.closed_at).strftime("%H:%M hs") if s.closed_at else "En curso",
             "closed_by": s.closed_by or "N/A",
             "reported_cash": s.reported_cash,
             "expected_cash": s.expected_cash,
@@ -1158,7 +1180,7 @@ def get_system_alerts(db: Session = Depends(get_db)):
             display=format_iso_to_ddmmyyyy(lot.expiration_date)
             if days<0:
                 key=f"exp-{lot.id}-{lot.expiration_date}"
-                append_alert(alerts,key,"EXPIRATION","CRITICAL",f"Lote vencido: {lot.product.name}",f"Quedan {lot.current_qty} {lot.product.unit_type}. Vencio {display}.",db,lot.product_id,lot.id,["WRITE_OFF","SEEN","SNOOZED","DISMISSED"])
+                append_alert(alerts,key,"EXPIRATION","CRITICAL",f"Lote vencido: {lot.product.name}",f"Quedan {lot.current_qty} {lot.product.unit_type}. Vencio {display}.",db,lot.product_id,lot.id,["SEEN","SNOOZED","DISMISSED"])
             elif days<=30:
                 level="IMPORTANT" if days<=7 else "INFO"
                 key=f"exp-{lot.id}-{lot.expiration_date}"
@@ -1171,10 +1193,10 @@ def get_system_alerts(db: Session = Depends(get_db)):
         policy=(product.replenishment_policy or "MRP").upper()
         if policy=="MRP":
             if product.stock<=0:
-                append_alert(alerts,f"stock-{product.id}-zero","STOCK","CRITICAL",f"Producto agotado: {product.name}",f"Stock 0 {product.unit_type}.",db,product.id)
+                append_alert(alerts,f"stock-{product.id}-zero-{round(product.stock or 0,3)}","STOCK","CRITICAL",f"Producto agotado: {product.name}",f"Stock 0 {product.unit_type}.",db,product.id)
             elif product.stock<=5:
                 bucket="low"
-                append_alert(alerts,f"stock-{product.id}-{bucket}","STOCK","IMPORTANT",f"Stock bajo: {product.name}",f"Quedan {product.stock} {product.unit_type}.",db,product.id)
+                append_alert(alerts,f"stock-{product.id}-{bucket}-{round(product.stock or 0,3)}","STOCK","IMPORTANT",f"Stock bajo: {product.name}",f"Quedan {product.stock} {product.unit_type}.",db,product.id)
 
         if (product.cost_price or 0)>0 and product.price_per_unit<=product.cost_price:
             signature=f"{round(product.cost_price,2)}-{round(product.price_per_unit,2)}"

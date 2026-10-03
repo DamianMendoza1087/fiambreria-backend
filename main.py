@@ -1119,6 +1119,25 @@ def create_product_master(
     )
 
     db.add(config)
+
+    # Un producto creado desde Feria nace exclusivo de Feria.
+    # Dejamos una configuración explícita deshabilitada en Fiambrería
+    # para impedir que la compatibilidad histórica lo habilite sola.
+    if branch_id != 1:
+        main_config = db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id == 1,
+            BranchProductDB.product_id == x.id
+        ).first()
+
+        if not main_config:
+            db.add(BranchProductDB(
+                branch_id=1,
+                product_id=x.id,
+                price_per_unit=prod.price_per_unit,
+                is_available=False,
+                is_exclusive=False
+            ))
+
     db.commit()
     db.refresh(x)
 

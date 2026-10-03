@@ -189,6 +189,10 @@ class SaleItemDB(Base):
     product_id = Column(Integer, ForeignKey("products.id"))
     product_name = Column(String, nullable=True)
     quantity = Column(Float, default=0.0)
+    unit_price = Column(Float, default=0.0)
+    unit_cost = Column(Float, default=0.0)
+    cogs = Column(Float, default=0.0)
+    gross_profit = Column(Float, default=0.0)
     sale = relationship("SaleDB", back_populates="items")
 
 class CashSessionDB(Base):
@@ -223,6 +227,13 @@ def ensure_v2_schema():
         for column_name, ddl in additions.items():
             if column_name not in existing:
                 conn.execute(text(f"ALTER TABLE products ADD COLUMN {column_name} {ddl}"))
+
+    sale_cols={c["name"] for c in inspector.get_columns("sale_items")}
+    sale_additions={"unit_price":"FLOAT DEFAULT 0","unit_cost":"FLOAT DEFAULT 0","cogs":"FLOAT DEFAULT 0","gross_profit":"FLOAT DEFAULT 0"}
+    with engine.begin() as conn:
+        for column_name, ddl in sale_additions.items():
+            if column_name not in sale_cols:
+                conn.execute(text(f"ALTER TABLE sale_items ADD COLUMN {column_name} {ddl}"))
 
 ensure_v2_schema()
 
@@ -357,6 +368,35 @@ class CashCloseSchema(BaseModel):
     reported_cash: float
     closed_by: str
     attempt_number: int
+
+class CashMovementCreateSchema(BaseModel):
+    movement_type: str = "OUT"
+    category: str
+    amount: float
+    concept: str
+    actor: Optional[str] = "Anonimo"
+    supplier: Optional[str] = None
+    employee_email: Optional[str] = None
+    notes: Optional[str] = None
+
+class StockLossSchema(BaseModel):
+    product_id: int
+    quantity: float
+    reason: str
+    actor: Optional[str] = "Anonimo"
+    lot_id: Optional[int] = None
+    notes: Optional[str] = None
+
+class AlertActionSchema(BaseModel):
+    action: str
+    actor: Optional[str] = "Anonimo"
+    snooze_hours: Optional[int] = 24
+    note: Optional[str] = None
+
+class ReplenishmentPolicySchema(BaseModel):
+    policy: str
+    actor: Optional[str] = "Anonimo"
+    reason: Optional[str] = None
 
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
@@ -749,6 +789,33 @@ def delete_presale(presale_id: int, db: Session = Depends(get_db)):
         return {"status": "ok"}
     raise HTTPException(status_code=404, detail="No encontrada")
 
+def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, actor: str, reason: str, db: Session, reference_type: Optional[str]=None, reference_id: Optional[int]=None, preferred_lot_id: Optional[int]=None):
+    if quantity <= 0:
+        raise HTTPException(status_code=422, detail="La cantidad debe ser mayor a cero")
+    if (product.stock or 0) + 0.000001 < quantity:
+        raise HTTPException(status_code=409, detail=f"Stock insuficiente de {product.name}")
+    remaining=quantity
+    total_cost=0.0
+    q=db.query(ProductLotDB).filter(ProductLotDB.product_id==product.id, ProductLotDB.current_qty>0)
+    lots=q.order_by(ProductLotDB.expiration_date.is_(None), ProductLotDB.expiration_date.asc(), ProductLotDB.created_at.asc()).all()
+    if preferred_lot_id is not None:
+        lots=sorted(lots, key=lambda x: 0 if x.id==preferred_lot_id else 1)
+    for lot in lots:
+        if remaining <= 0:
+            break
+        take=min(lot.current_qty, remaining)
+        lot.current_qty-=take
+        remaining-=take
+        uc=lot.cost_price or product.cost_price or 0.0
+        total_cost+=take*uc
+        db.add(StockMovementDB(product_id=product.id, lot_id=lot.id, movement_type=movement_type, quantity=-take, unit_cost=uc, reason=reason, actor=actor, reference_type=reference_type, reference_id=reference_id))
+    if remaining > 0.000001:
+        uc=product.cost_price or 0.0
+        total_cost+=remaining*uc
+        db.add(StockMovementDB(product_id=product.id, movement_type=movement_type, quantity=-remaining, unit_cost=uc, reason=reason, actor=actor, reference_type=reference_type, reference_id=reference_id))
+    product.stock=(product.stock or 0)-quantity
+    return total_cost
+
 @app.get("/cash/status")
 def get_cash_status(db: Session = Depends(get_db)):
     active_session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
@@ -782,51 +849,60 @@ def open_cash(payload: CashOpenSchema, db: Session = Depends(get_db)):
 
 @app.post("/sales/finalize")
 def finalize_sale(payload: FinalizeSaleSchema, db: Session = Depends(get_db)):
-    active_session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True).first()
-    session_id = active_session.id if active_session else None
-
-    sale = SaleDB(
-        presale_id=payload.presale_id,
-        session_id=session_id,
-        total_amount=payload.total_amount,
-        amount_cash=payload.amount_cash,
-        amount_mp=payload.amount_mp,
-        payment_method=payload.payment_method,
-        sold_by=payload.sold_by
-    )
-    db.add(sale)
-    db.flush()
-
+    active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True).first()
+    sale=SaleDB(presale_id=payload.presale_id, session_id=active.id if active else None, total_amount=payload.total_amount, amount_cash=payload.amount_cash, amount_mp=payload.amount_mp, payment_method=payload.payment_method, sold_by=payload.sold_by)
+    db.add(sale); db.flush()
+    products={}
     for item in payload.items:
-        prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
-        if prod:
-            prod.stock = max(0.0, prod.stock - item.quantity)
-            
-            remaining_to_discount = item.quantity
-            lots = db.query(ProductLotDB).filter(
-                ProductLotDB.product_id == prod.id,
-                ProductLotDB.current_qty > 0
-            ).order_by(ProductLotDB.expiration_date.asc()).all()
-
-            for lot in lots:
-                if remaining_to_discount <= 0:
-                    break
-                if lot.current_qty >= remaining_to_discount:
-                    lot.current_qty -= remaining_to_discount
-                    remaining_to_discount = 0
-                else:
-                    remaining_to_discount -= lot.current_qty
-                    lot.current_qty = 0
-
-            db.add(SaleItemDB(sale_id=sale.id, product_id=prod.id, product_name=prod.name, quantity=item.quantity))
-
+        x=db.query(ProductDB).filter(ProductDB.id==item.product_id).first()
+        if not x:
+            raise HTTPException(status_code=404, detail=f"Producto {item.product_id} no encontrado")
+        if item.quantity<=0 or (x.stock or 0)<item.quantity:
+            raise HTTPException(status_code=409, detail=f"Stock insuficiente o cantidad invalida: {x.name}")
+        products[item.product_id]=x
+    for item in payload.items:
+        x=products[item.product_id]
+        cost=consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta", db, "sale", sale.id)
+        revenue=(x.price_per_unit or 0)*item.quantity
+        db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_price=x.price_per_unit or 0, unit_cost=cost/item.quantity, cogs=cost, gross_profit=revenue-cost))
     if payload.presale_id:
-        ps = db.query(PreSaleDB).filter(PreSaleDB.id == payload.presale_id).first()
-        if ps:
-            ps.status = "COMPLETADA"
-
+        ps=db.query(PreSaleDB).filter(PreSaleDB.id==payload.presale_id).first()
+        if ps: ps.status="COMPLETADA"
     db.commit()
-    return {"status": "success", "message": "Venta procesada"}
+    return {"status":"success","message":"Venta procesada","sale_id":sale.id}
+
+@app.post("/cash/movements")
+def create_cash_movement(payload: CashMovementCreateSchema, db: Session = Depends(get_db)):
+    if payload.amount<=0:
+        raise HTTPException(status_code=422, detail="Monto invalido")
+    movement=payload.movement_type.upper()
+    if movement not in ("IN","OUT"):
+        raise HTTPException(status_code=422, detail="movement_type debe ser IN u OUT")
+    active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True).first()
+    row=CashMovementDB(session_id=active.id if active else None, movement_type=movement, category=payload.category.upper(), amount=payload.amount, concept=payload.concept, actor=payload.actor, supplier=payload.supplier, employee_email=payload.employee_email, notes=payload.notes)
+    db.add(row); db.commit(); db.refresh(row)
+    return row
+
+@app.get("/cash/movements")
+def list_cash_movements(session_id: Optional[int]=None, db: Session=Depends(get_db)):
+    q=db.query(CashMovementDB)
+    if session_id is not None:
+        q=q.filter(CashMovementDB.session_id==session_id)
+    return q.order_by(CashMovementDB.id.desc()).limit(500).all()
+
+@app.post("/stock/losses")
+def create_stock_loss(payload: StockLossSchema, db: Session=Depends(get_db)):
+    allowed={"VENCIMIENTO","ROTURA","DIFERENCIA_INVENTARIO","CONSUMO_INTERNO","MERMA_CORTE","OTRO"}
+    reason=payload.reason.upper().strip()
+    if reason not in allowed:
+        raise HTTPException(status_code=422, detail="Motivo de merma invalido")
+    x=db.query(ProductDB).filter(ProductDB.id==payload.product_id).first()
+    if not x:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    cost=consume_stock_fefo(x, payload.quantity, "LOSS", payload.actor or "Anonimo", reason, db, "stock_loss", None, payload.lot_id)
+    db.add(AuditEventDB(entity_type="stock_loss", entity_id=x.id, field_name="stock", old_value=None, new_value=str(-payload.quantity), actor=payload.actor, reason=reason))
+    db.commit()
+    return {"status":"success","product_id":x.id,"quantity":payload.quantity,"economic_loss":round(cost,2),"reason":reason,"stock":x.stock}
 
 @app.post("/cash/close")
 def close_cash(payload: CashCloseSchema, db: Session = Depends(get_db)):
@@ -838,7 +914,10 @@ def close_cash(payload: CashCloseSchema, db: Session = Depends(get_db)):
     total_cash_sales = sum(s.amount_cash for s in sales)
     total_mp_sales = sum(s.amount_mp for s in sales)
     
-    expected_cash = session.initial_amount + total_cash_sales
+    movements=db.query(CashMovementDB).filter(CashMovementDB.session_id==session.id).all()
+    cash_in=sum(m.amount for m in movements if m.movement_type=="IN")
+    cash_out=sum(m.amount for m in movements if m.movement_type=="OUT")
+    expected_cash = session.initial_amount + total_cash_sales + cash_in - cash_out
     diff = payload.reported_cash - expected_cash
 
     if payload.attempt_number == 1 and abs(diff) > 0.01:
@@ -895,114 +974,128 @@ def get_cash_audits(date: Optional[str] = None, db: Session = Depends(get_db)):
         })
     return result
 
+@app.patch("/products/{product_id}/replenishment-policy")
+def update_replenishment_policy(product_id: int, payload: ReplenishmentPolicySchema, db: Session = Depends(get_db)):
+    allowed={"MRP","MANUAL","PAUSED","DISCONTINUED"}
+    policy=payload.policy.upper().strip()
+    if policy not in allowed:
+        raise HTTPException(status_code=422, detail="Politica invalida: MRP, MANUAL, PAUSED o DISCONTINUED")
+    product=db.query(ProductDB).filter(ProductDB.id==product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    old=product.replenishment_policy or "MRP"
+    product.replenishment_policy=policy
+    if policy=="DISCONTINUED":
+        product.is_active=False
+    db.add(AuditEventDB(entity_type="product",entity_id=product.id,field_name="replenishment_policy",old_value=old,new_value=policy,actor=payload.actor,reason=payload.reason or "Cambio de politica de reposicion"))
+    db.commit()
+    return {"status":"success","product_id":product.id,"policy":policy}
+
 @app.get("/mrp/suggestions")
 def get_mrp_suggestions(days: int = 7, target_days: int = 3, db: Session = Depends(get_db)):
-    since_date = datetime.datetime.utcnow() - datetime.timedelta(days=days)
-    sales = db.query(SaleDB).filter(SaleDB.created_at >= since_date).all()
-    
-    sales_by_prod = {}
-    for s in sales:
-        for item in s.items:
-            sales_by_prod[item.product_id] = sales_by_prod.get(item.product_id, 0.0) + item.quantity
-
-    products = db.query(ProductDB).filter(ProductDB.is_active == True).all()
-    suggestions = []
-
-    for p in products:
-        total_sold = sales_by_prod.get(p.id, 0.0)
-        daily_demand = total_sold / max(1, days)
-        
-        if total_sold <= 0:
+    since=datetime.datetime.utcnow()-datetime.timedelta(days=days)
+    sales=db.query(SaleDB).filter(SaleDB.created_at>=since).all()
+    sales_by_prod={}
+    for sale in sales:
+        for item in sale.items:
+            sales_by_prod[item.product_id]=sales_by_prod.get(item.product_id,0.0)+item.quantity
+    suggestions=[]
+    products=db.query(ProductDB).filter(ProductDB.is_active==True).all()
+    for product in products:
+        policy=(product.replenishment_policy or "MRP").upper()
+        if policy!="MRP":
             continue
+        total_sold=sales_by_prod.get(product.id,0.0)
+        if total_sold<=0:
+            continue
+        daily=total_sold/max(1,days)
+        target=daily*target_days
+        buy=max(0.0,target-(product.stock or 0))
+        status="OK"
+        if product.stock<=0: status="AGOTADO"
+        elif product.stock<daily: status="CRITICO"
+        elif buy>0: status="REPOSICION_RECOMENDADA"
+        suggestions.append({"product_id":product.id,"product_name":product.name,"supplier":product.supplier or "Sin Proveedor","current_stock":product.stock,"unit_type":product.unit_type,"total_sold_period":round(total_sold,2),"daily_demand":round(daily,2),"target_days":target_days,"suggested_buy":round(buy,2),"estimated_cost":round(buy*(product.cost_price or 0),2),"status":status,"replenishment_policy":policy})
+    return sorted(suggestions,key=lambda x:x["suggested_buy"],reverse=True)
 
-        stock_target = daily_demand * target_days
-        suggested_buy = max(0.0, stock_target - p.stock)
+def alert_is_visible(alert_key: str, db: Session):
+    state=db.query(AlertStateDB).filter(AlertStateDB.alert_key==alert_key).first()
+    if not state:
+        return True,"NEW"
+    status=(state.status or "NEW").upper()
+    if status in ("RESOLVED","DISMISSED"):
+        return False,status
+    if status=="SNOOZED" and state.snoozed_until and state.snoozed_until>datetime.datetime.utcnow():
+        return False,status
+    if status=="SNOOZED" and (not state.snoozed_until or state.snoozed_until<=datetime.datetime.utcnow()):
+        state.status="NEW"
+        db.commit()
+        return True,"NEW"
+    return True,status
 
-        status = "OK"
-        if p.stock <= 0:
-            status = "AGOTADO"
-        elif p.stock < (daily_demand * 1):
-            status = "CRÍTICO"
-        elif suggested_buy > 0:
-            status = "REPOSICIÓN RECOMENDADA"
+def append_alert(alerts, key, alert_type, level, title, detail, db, product_id=None, lot_id=None, actions=None):
+    visible,state=alert_is_visible(key,db)
+    if visible:
+        alerts.append({"id":key,"type":alert_type,"level":level,"severity":level,"title":title,"detail":detail,"state":state,"product_id":product_id,"lot_id":lot_id,"actions":actions or ["SEEN","SNOOZED","RESOLVED","DISMISSED"]})
 
-        suggestions.append({
-            "product_id": p.id,
-            "product_name": p.name,
-            "supplier": p.supplier or "Sin Proveedor",
-            "current_stock": p.stock,
-            "unit_type": p.unit_type,
-            "total_sold_period": round(total_sold, 2),
-            "daily_demand": round(daily_demand, 2),
-            "target_days": target_days,
-            "suggested_buy": round(suggested_buy, 2),
-            "estimated_cost": round(suggested_buy * (p.cost_price or 0.0), 2),
-            "status": status
-        })
+@app.post("/alerts/{alert_key}/action")
+def update_alert_state(alert_key: str, payload: AlertActionSchema, db: Session = Depends(get_db)):
+    action=payload.action.upper().strip()
+    mapping={"VIEW":"SEEN","SEEN":"SEEN","POSTPONE":"SNOOZED","SNOOZE":"SNOOZED","SNOOZED":"SNOOZED","RESOLVE":"RESOLVED","RESOLVED":"RESOLVED","DISMISS":"DISMISSED","DISMISSED":"DISMISSED","NEW":"NEW"}
+    if action not in mapping:
+        raise HTTPException(status_code=422,detail="Accion de alerta invalida")
+    status=mapping[action]
+    state=db.query(AlertStateDB).filter(AlertStateDB.alert_key==alert_key).first()
+    if not state:
+        state=AlertStateDB(alert_key=alert_key)
+        db.add(state)
+    state.status=status
+    state.updated_at=datetime.datetime.utcnow()
+    state.resolved_by=payload.actor
+    state.resolution_note=payload.note
+    state.snoozed_until=(datetime.datetime.utcnow()+datetime.timedelta(hours=max(1,payload.snooze_hours or 24))) if status=="SNOOZED" else None
+    db.add(AuditEventDB(entity_type="alert",entity_id=state.id,field_name="status",old_value=None,new_value=status,actor=payload.actor,reason=payload.note or f"Alerta {status}"))
+    db.commit(); db.refresh(state)
+    return {"status":"success","alert_key":alert_key,"state":state.status,"snoozed_until":state.snoozed_until}
 
-    return sorted(suggestions, key=lambda x: x["suggested_buy"], reverse=True)
+@app.get("/alerts/history")
+def get_alert_history(limit: int = 200, db: Session = Depends(get_db)):
+    states=db.query(AlertStateDB).order_by(AlertStateDB.updated_at.desc()).limit(min(max(limit,1),500)).all()
+    return states
 
 @app.get("/alerts")
 def get_system_alerts(db: Session = Depends(get_db)):
-    alerts = []
-    today = datetime.date.today()
-
-    active_lots = db.query(ProductLotDB).join(ProductDB).filter(
-        ProductDB.is_active == True,
-        ProductLotDB.current_qty > 0,
-        ProductLotDB.expiration_date != None
-    ).all()
-
+    alerts=[]
+    today=datetime.date.today()
+    active_lots=db.query(ProductLotDB).join(ProductDB).filter(ProductDB.is_active==True,ProductLotDB.current_qty>0,ProductLotDB.expiration_date!=None).all()
     for lot in active_lots:
         try:
-            exp_date = datetime.datetime.strptime(lot.expiration_date, "%Y-%m-%d").date()
-            days_left = (exp_date - today).days
-            display_date = format_iso_to_ddmmyyyy(lot.expiration_date)
+            exp=datetime.datetime.strptime(lot.expiration_date,"%Y-%m-%d").date()
+            days=(exp-today).days
+            display=format_iso_to_ddmmyyyy(lot.expiration_date)
+            if days<0:
+                key=f"exp-{lot.id}-{lot.expiration_date}"
+                append_alert(alerts,key,"EXPIRATION","CRITICAL",f"Lote vencido: {lot.product.name}",f"Quedan {lot.current_qty} {lot.product.unit_type}. Vencio {display}.",db,lot.product_id,lot.id,["WRITE_OFF","SEEN","SNOOZED","DISMISSED"])
+            elif days<=30:
+                level="IMPORTANT" if days<=7 else "INFO"
+                key=f"exp-{lot.id}-{lot.expiration_date}"
+                append_alert(alerts,key,"EXPIRATION",level,f"Vencimiento proximo ({days} dias): {lot.product.name}",f"Lote {lot.current_qty} {lot.product.unit_type}; vence {display}.",db,lot.product_id,lot.id,["SEEN","SNOOZED","DISMISSED"])
+        except (ValueError,TypeError):
+            continue
 
-            if days_left < 0:
-                alerts.append({
-                    "id": f"exp-{lot.id}", "type": "EXPIRATION", "level": "CRITICAL",
-                    "title": f"🚨 Lote Vencido: {lot.product.name}",
-                    "detail": f"Quedan {lot.current_qty} {lot.product.unit_type} vencidas el {display_date}. Proveedor: {lot.supplier or 'N/A'}"
-                })
-            elif days_left <= 30:
-                alerts.append({
-                    "id": f"exp-{lot.id}", "type": "EXPIRATION", "level": "WARNING",
-                    "title": f"⏳ Vencimiento Próximo ({days_left} días): {lot.product.name}",
-                    "detail": f"Lote de {lot.current_qty} {lot.product.unit_type} vence el {display_date}. Proveedor: {lot.supplier or 'N/A'}"
-                })
-        except Exception:
-            pass
+    products=db.query(ProductDB).filter(ProductDB.is_active==True).all()
+    for product in products:
+        policy=(product.replenishment_policy or "MRP").upper()
+        if policy=="MRP":
+            if product.stock<=0:
+                append_alert(alerts,f"stock-{product.id}-zero","STOCK","CRITICAL",f"Producto agotado: {product.name}",f"Stock 0 {product.unit_type}.",db,product.id)
+            elif product.stock<=5:
+                bucket="low"
+                append_alert(alerts,f"stock-{product.id}-{bucket}","STOCK","IMPORTANT",f"Stock bajo: {product.name}",f"Quedan {product.stock} {product.unit_type}.",db,product.id)
 
-    active_products = db.query(ProductDB).filter(ProductDB.is_active == True).all()
-    for p in active_products:
-        if p.stock <= 0:
-            alerts.append({
-                "id": f"stock-{p.id}", "type": "STOCK", "level": "CRITICAL",
-                "title": f"🔴 Producto Agotado: {p.name}", "detail": f"Stock en 0 {p.unit_type}."
-            })
-        elif p.stock <= 5:
-            alerts.append({
-                "id": f"stock-{p.id}", "type": "STOCK", "level": "WARNING",
-                "title": f"⚠️ Stock Bajo: {p.name}", "detail": f"Quedan únicamente {p.stock} {p.unit_type}."
-            })
+        if (product.cost_price or 0)>0 and product.price_per_unit<=product.cost_price:
+            signature=f"{round(product.cost_price,2)}-{round(product.price_per_unit,2)}"
+            append_alert(alerts,f"price-{product.id}-{signature}","PRICE","CRITICAL",f"PVP debajo del costo: {product.name}",f"Costo {product.cost_price}; PVP {product.price_per_unit}.",db,product.id,actions=["SEEN","SNOOZED","DISMISSED"])
 
-    for p in active_products:
-        if p.cost_price > 0:
-            if p.price_per_unit <= p.cost_price:
-                alerts.append({
-                    "id": f"price-{p.id}", "type": "PRICE", "level": "CRITICAL",
-                    "title": f"💸 Precio de Venta Bajo / Pérdida: {p.name}",
-                    "detail": f"Costo actual (${p.cost_price}) >= PVP (${p.price_per_unit})."
-                })
-            elif p.previous_cost_price > 0 and p.cost_price > p.previous_cost_price:
-                old_margin = ((p.price_per_unit - p.previous_cost_price) / p.price_per_unit) * 100.0
-                new_margin = ((p.price_per_unit - p.cost_price) / p.price_per_unit) * 100.0
-                if new_margin < (old_margin - 5.0):
-                    alerts.append({
-                        "id": f"price-increase-{p.id}", "type": "PRICE", "level": "HIGH",
-                        "title": f"⚠️ Aumento de Costo no Trasladado: {p.name}",
-                        "detail": f"Costo subió de ${p.previous_cost_price} a ${p.cost_price}. Margen bajó de {old_margin:.1f}% a {new_margin:.1f}%."
-                    })
-
-    return alerts
+    order={"CRITICAL":0,"IMPORTANT":1,"INFO":2}
+    return sorted(alerts,key=lambda x:order.get(x["level"],9))

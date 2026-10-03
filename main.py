@@ -971,8 +971,9 @@ def delete_presale(presale_id: int, db: Session = Depends(get_db)):
 def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, actor: str, reason: str, db: Session, reference_type: Optional[str]=None, reference_id: Optional[int]=None, preferred_lot_id: Optional[int]=None, branch_id: int = 1):
     if quantity <= 0:
         raise HTTPException(status_code=422, detail="La cantidad debe ser mayor a cero")
-    if (product.stock or 0) + 0.000001 < quantity:
-        raise HTTPException(status_code=409, detail=f"Stock insuficiente de {product.name}")
+    branch_stock = get_branch_stock(db, product.id, branch_id)
+    if branch_stock + 0.000001 < quantity:
+        raise HTTPException(status_code=409, detail=f"Stock insuficiente de {product.name} en esta sucursal")
     remaining=quantity
     total_cost=0.0
     q=db.query(ProductLotDB).filter(ProductLotDB.product_id==product.id, ProductLotDB.branch_id==branch_id, ProductLotDB.current_qty>0)
@@ -994,6 +995,15 @@ def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, 
         db.add(StockMovementDB(branch_id=branch_id, product_id=product.id, movement_type=movement_type, quantity=-remaining, unit_cost=uc, reason=reason, actor=actor, reference_type=reference_type, reference_id=reference_id))
     product.stock=(product.stock or 0)-quantity
     return total_cost
+
+
+def get_branch_stock(db: Session, product_id: int, branch_id: int = 1) -> float:
+    value = db.query(func.coalesce(func.sum(ProductLotDB.current_qty), 0.0)).filter(
+        ProductLotDB.product_id == product_id,
+        ProductLotDB.branch_id == branch_id
+    ).scalar()
+    return float(value or 0.0)
+
 
 @app.get("/cash/status")
 def get_cash_status(branch_id: int = 1, db: Session = Depends(get_db)):
@@ -1036,7 +1046,7 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
         x=db.query(ProductDB).filter(ProductDB.id==item.product_id).first()
         if not x:
             raise HTTPException(status_code=404, detail=f"Producto {item.product_id} no encontrado")
-        if item.quantity<=0 or (x.stock or 0)<item.quantity:
+        if item.quantity<=0 or get_branch_stock(db,x.id,branch_id)<item.quantity:
             raise HTTPException(status_code=409, detail=f"Stock insuficiente o cantidad invalida: {x.name}")
         products[item.product_id]=x
     for item in payload.items:
@@ -1074,7 +1084,7 @@ def list_cash_movements(session_id: Optional[int]=None, branch_id: int = 1, db: 
     return q.order_by(CashMovementDB.id.desc()).limit(500).all()
 
 @app.post("/stock/losses")
-def create_stock_loss(payload: StockLossSchema, db: Session=Depends(get_db)):
+def create_stock_loss(payload: StockLossSchema, branch_id: int = 1, db: Session=Depends(get_db)):
     allowed={"VENCIMIENTO","ROTURA","DIFERENCIA_INVENTARIO","CONSUMO_INTERNO","MERMA_CORTE","OTRO"}
     reason=payload.reason.upper().strip()
     if reason not in allowed:
@@ -1082,7 +1092,7 @@ def create_stock_loss(payload: StockLossSchema, db: Session=Depends(get_db)):
     x=db.query(ProductDB).filter(ProductDB.id==payload.product_id).first()
     if not x:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
-    cost=consume_stock_fefo(x, payload.quantity, "LOSS", payload.actor or "Anonimo", reason, db, "stock_loss", None, payload.lot_id)
+    cost=consume_stock_fefo(x, payload.quantity, "LOSS", payload.actor or "Anonimo", reason, db, "stock_loss", None, payload.lot_id, branch_id=branch_id)
     db.add(AuditEventDB(entity_type="stock_loss", entity_id=x.id, field_name="stock", old_value=None, new_value=str(-payload.quantity), actor=payload.actor, reason=reason))
     db.commit()
     return {"status":"success","product_id":x.id,"quantity":payload.quantity,"economic_loss":round(cost,2),"reason":reason,"stock":x.stock}

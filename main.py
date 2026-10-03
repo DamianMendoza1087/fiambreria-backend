@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel
@@ -72,6 +72,80 @@ class ProductLotDB(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     product = relationship("ProductDB", back_populates="lots")
 
+class ProductIngressDB(Base):
+    __tablename__ = "product_ingresses"
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
+    supplier = Column(String, nullable=True)
+    cost_price = Column(Float, default=0.0)
+    quantity = Column(Float, default=0.0)
+    lot_number = Column(String, nullable=True)
+    expiration_date = Column(String, nullable=True)
+    received_at = Column(DateTime, default=datetime.datetime.utcnow)
+    received_by = Column(String, nullable=True)
+    notes = Column(Text, nullable=True)
+
+class StockMovementDB(Base):
+    __tablename__ = "stock_movements"
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
+    lot_id = Column(Integer, ForeignKey("product_lots.id"), nullable=True)
+    movement_type = Column(String, nullable=False)
+    quantity = Column(Float, nullable=False)
+    unit_cost = Column(Float, default=0.0)
+    reason = Column(String, nullable=True)
+    actor = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    reference_type = Column(String, nullable=True)
+    reference_id = Column(Integer, nullable=True)
+    notes = Column(Text, nullable=True)
+
+class AuditEventDB(Base):
+    __tablename__ = "audit_events"
+    id = Column(Integer, primary_key=True, index=True)
+    entity_type = Column(String, nullable=False, index=True)
+    entity_id = Column(Integer, nullable=True, index=True)
+    field_name = Column(String, nullable=True)
+    old_value = Column(Text, nullable=True)
+    new_value = Column(Text, nullable=True)
+    actor = Column(String, nullable=True)
+    reason = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class PriceHistoryDB(Base):
+    __tablename__ = "price_history"
+    id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
+    old_price = Column(Float, nullable=True)
+    new_price = Column(Float, nullable=False)
+    changed_by = Column(String, nullable=True)
+    reason = Column(String, nullable=True)
+    changed_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class CashMovementDB(Base):
+    __tablename__ = "cash_movements"
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("cash_sessions.id"), nullable=True, index=True)
+    movement_type = Column(String, nullable=False)
+    category = Column(String, nullable=False)
+    amount = Column(Float, nullable=False)
+    concept = Column(String, nullable=False)
+    actor = Column(String, nullable=True)
+    supplier = Column(String, nullable=True)
+    employee_email = Column(String, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class AlertStateDB(Base):
+    __tablename__ = "alert_states"
+    id = Column(Integer, primary_key=True, index=True)
+    alert_key = Column(String, unique=True, nullable=False, index=True)
+    status = Column(String, default="NEW")
+    snoozed_until = Column(DateTime, nullable=True)
+    resolved_by = Column(String, nullable=True)
+    resolution_note = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
 class PreSaleDB(Base):
     __tablename__ = "presales"
     id = Column(Integer, primary_key=True, index=True)
@@ -131,6 +205,24 @@ class CashSessionDB(Base):
     status_message = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
+
+def ensure_v2_schema():
+    # Migracion aditiva V2 para SQLite. Conserva los datos existentes.
+    Base.metadata.create_all(bind=engine)
+    inspector = inspect(engine)
+    existing = {c["name"] for c in inspector.get_columns("products")}
+    additions = {
+        "requires_expiration": "BOOLEAN DEFAULT 0",
+        "replenishment_policy": "VARCHAR DEFAULT 'MRP'",
+        "brand": "VARCHAR",
+    }
+    with engine.begin() as conn:
+        for column_name, ddl in additions.items():
+            if column_name not in existing:
+                conn.execute(text(f"ALTER TABLE products ADD COLUMN {column_name} {ddl}"))
+
+ensure_v2_schema()
+
 
 app = FastAPI(title="Fiambrería POS, RRHH, MRP, KPIs & Permisos API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])

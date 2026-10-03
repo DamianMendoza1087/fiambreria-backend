@@ -642,8 +642,12 @@ def _economic_cash_category(category: str):
         return "operating"
     return "other"
 
-def build_profitability(start: datetime.datetime, end: datetime.datetime, db: Session):
-    sales=db.query(SaleDB).filter(SaleDB.created_at>=start,SaleDB.created_at<end).all()
+def build_profitability(start: datetime.datetime, end: datetime.datetime, db: Session, branch_id: int = 1):
+    sales=db.query(SaleDB).filter(
+        SaleDB.created_at>=start,
+        SaleDB.created_at<end,
+        SaleDB.branch_id==branch_id
+    ).all()
     sale_ids=[x.id for x in sales]
     items=db.query(SaleItemDB).filter(SaleItemDB.sale_id.in_(sale_ids)).all() if sale_ids else []
     revenue=round(sum(float(x.total_amount or 0) for x in sales),2)
@@ -652,12 +656,16 @@ def build_profitability(start: datetime.datetime, end: datetime.datetime, db: Se
 
     losses=db.query(StockMovementDB).filter(
         StockMovementDB.movement_type=="LOSS",
-        StockMovementDB.created_at>=start,StockMovementDB.created_at<end
+        StockMovementDB.created_at>=start,
+        StockMovementDB.created_at<end,
+        StockMovementDB.branch_id==branch_id
     ).all()
     loss_cost=round(sum(abs(float(x.quantity or 0))*float(x.unit_cost or 0) for x in losses),2)
 
     movements=db.query(CashMovementDB).filter(
-        CashMovementDB.created_at>=start,CashMovementDB.created_at<end
+        CashMovementDB.created_at>=start,
+        CashMovementDB.created_at<end,
+        CashMovementDB.branch_id==branch_id
     ).all()
     cash_in=round(sum(float(x.amount or 0) for x in movements if (x.movement_type or "").upper()=="IN"),2)
     cash_out=round(sum(float(x.amount or 0) for x in movements if (x.movement_type or "").upper()=="OUT"),2)
@@ -692,19 +700,21 @@ def build_profitability(start: datetime.datetime, end: datetime.datetime, db: Se
     }
 
 @app.get("/kpis/profitability")
-def get_profitability(period: str="month", db: Session=Depends(get_db)):
+def get_profitability(period: str="month", branch_id: int=1, db: Session=Depends(get_db)):
     start,end,label=_kpi_period(period)
-    data=build_profitability(start,end,db)
+    data=build_profitability(start,end,db,branch_id)
     return {"period":label,"from":start.isoformat(),"to":end.isoformat(),**data}
 
 @app.get("/kpis/dashboard")
-def get_kpis_dashboard(period: str="month", db: Session=Depends(get_db)):
+def get_kpis_dashboard(period: str="month", branch_id: int=1, db: Session=Depends(get_db)):
     start,end,label=_kpi_period(period)
-    data=build_profitability(start,end,db)
+    data=build_profitability(start,end,db,branch_id)
     top=db.query(SaleItemDB.product_name,func.sum(SaleItemDB.quantity).label("qty")).join(SaleDB).filter(
-        SaleDB.created_at>=start,SaleDB.created_at<end
+        SaleDB.created_at>=start,
+        SaleDB.created_at<end,
+        SaleDB.branch_id==branch_id
     ).group_by(SaleItemDB.product_name).order_by(func.sum(SaleItemDB.quantity).desc()).limit(10).all()
-    alerts=get_system_alerts(db)
+    alerts=get_system_alerts(branch_id=branch_id, db=db)
     critical=sum(1 for a in alerts if a.get("level")=="CRITICAL")
     important=sum(1 for a in alerts if a.get("level") in ("IMPORTANT","WARNING","HIGH"))
     return {
@@ -1792,10 +1802,15 @@ def get_alert_history(limit: int = 200, db: Session = Depends(get_db)):
     return [{"id":x.id,"alert_state_id":x.entity_id,"old_state":x.old_value,"new_state":x.new_value,"actor":x.actor,"note":x.reason,"created_at":x.created_at} for x in rows]
 
 @app.get("/alerts")
-def get_system_alerts(db: Session = Depends(get_db)):
+def get_system_alerts(branch_id: int = 1, db: Session = Depends(get_db)):
     alerts=[]
     today=datetime.date.today()
-    active_lots=db.query(ProductLotDB).join(ProductDB).filter(ProductDB.is_active==True,ProductLotDB.current_qty>0,ProductLotDB.expiration_date!=None).all()
+    active_lots=db.query(ProductLotDB).join(ProductDB).filter(
+        ProductDB.is_active==True,
+        ProductLotDB.branch_id==branch_id,
+        ProductLotDB.current_qty>0,
+        ProductLotDB.expiration_date!=None
+    ).all()
     for lot in active_lots:
         try:
             exp=datetime.datetime.strptime(lot.expiration_date,"%Y-%m-%d").date()
@@ -1813,17 +1828,28 @@ def get_system_alerts(db: Session = Depends(get_db)):
 
     products=db.query(ProductDB).filter(ProductDB.is_active==True).all()
     for product in products:
-        policy=(product.replenishment_policy or "MRP").upper()
-        if policy=="MRP":
-            if product.stock<=0:
-                append_alert(alerts,f"stock-{product.id}-zero-{round(product.stock or 0,3)}","STOCK","CRITICAL",f"Producto agotado: {product.name}",f"Stock 0 {product.unit_type}.",db,product.id)
-            elif product.stock<=5:
-                bucket="low"
-                append_alert(alerts,f"stock-{product.id}-{bucket}-{round(product.stock or 0,3)}","STOCK","IMPORTANT",f"Stock bajo: {product.name}",f"Quedan {product.stock} {product.unit_type}.",db,product.id)
+        config=db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id==branch_id,
+            BranchProductDB.product_id==product.id,
+            BranchProductDB.is_available==True
+        ).first()
 
-        if (product.cost_price or 0)>0 and product.price_per_unit<=product.cost_price:
-            signature=f"{round(product.cost_price,2)}-{round(product.price_per_unit,2)}"
-            append_alert(alerts,f"price-{product.id}-{signature}","PRICE","CRITICAL",f"PVP debajo del costo: {product.name}",f"Costo {product.cost_price}; PVP {product.price_per_unit}.",db,product.id,actions=["SEEN","SNOOZED","DISMISSED"])
+        if not config:
+            continue
+
+        branch_stock=get_branch_stock(db,product.id,branch_id)
+        policy=(product.replenishment_policy or "MRP").upper()
+
+        if policy=="MRP":
+            if branch_stock<=0:
+                append_alert(alerts,f"stock-b{branch_id}-{product.id}-zero","STOCK","CRITICAL",f"Producto agotado: {product.name}",f"Stock 0 {product.unit_type}.",db,product.id)
+            elif branch_stock<=5:
+                append_alert(alerts,f"stock-b{branch_id}-{product.id}-low-{round(branch_stock,3)}","STOCK","IMPORTANT",f"Stock bajo: {product.name}",f"Quedan {branch_stock} {product.unit_type}.",db,product.id)
+
+        branch_price=config.price_per_unit if config.price_per_unit is not None else product.price_per_unit
+        if (product.cost_price or 0)>0 and branch_price<=product.cost_price:
+            signature=f"b{branch_id}-{round(product.cost_price,2)}-{round(branch_price,2)}"
+            append_alert(alerts,f"price-{product.id}-{signature}","PRICE","CRITICAL",f"PVP debajo del costo: {product.name}",f"Costo {product.cost_price}; PVP {branch_price}.",db,product.id,actions=["SEEN","SNOOZED","DISMISSED"])
 
     order={"CRITICAL":0,"IMPORTANT":1,"INFO":2}
     return sorted(alerts,key=lambda x:order.get(x["level"],9))

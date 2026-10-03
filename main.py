@@ -1067,17 +1067,21 @@ def correct_ingress(ingress_id: int, payload: IngressCorrectionSchema, db: Sessi
     if payload.quantity is not None:
         if payload.quantity<=0: raise HTTPException(status_code=422,detail="La cantidad debe ser mayor a cero")
         diff=payload.quantity-ing.quantity
-        if lot.current_qty+diff < -0.000001 or (product.stock or 0)+diff < -0.000001: raise HTTPException(status_code=409,detail="No se puede reducir el ingreso: parte de ese stock ya fue consumido")
+        if lot.current_qty + diff < -0.000001:
+            raise HTTPException(status_code=409, detail="No se puede reducir el ingreso: parte de ese lote ya fue consumido")
         audit("quantity",ing.quantity,payload.quantity)
         if abs(diff)>0.000001:
             lot.initial_qty+=diff; lot.current_qty+=diff; product.stock=(product.stock or 0)+diff
-            db.add(StockMovementDB(product_id=product.id,lot_id=lot.id,movement_type="ADJUSTMENT",quantity=diff,unit_cost=lot.cost_price or 0,reason=f"Correccion ingreso #{ing.id}",actor=payload.actor,reference_type="product_ingress_correction",reference_id=ing.id,notes=payload.reason))
+            db.add(StockMovementDB(branch_id=ing.branch_id,product_id=product.id,lot_id=lot.id,movement_type="ADJUSTMENT",quantity=diff,unit_cost=lot.cost_price or 0,reason=f"Correccion ingreso #{ing.id}",actor=payload.actor,reference_type="product_ingress_correction",reference_id=ing.id,notes=payload.reason))
             ing.quantity=payload.quantity
     if payload.cost_price is not None:
         if payload.cost_price<0: raise HTTPException(status_code=422,detail="El costo no puede ser negativo")
         audit("cost_price",ing.cost_price,payload.cost_price); ing.cost_price=payload.cost_price; lot.cost_price=payload.cost_price
         if movement: movement.unit_cost=payload.cost_price
-        latest=db.query(ProductIngressDB).filter(ProductIngressDB.product_id==product.id).order_by(ProductIngressDB.received_at.desc(),ProductIngressDB.id.desc()).first()
+        latest=db.query(ProductIngressDB).filter(
+            ProductIngressDB.product_id==product.id,
+            ProductIngressDB.branch_id==ing.branch_id
+        ).order_by(ProductIngressDB.received_at.desc(),ProductIngressDB.id.desc()).first()
         if latest and latest.id==ing.id: product.previous_cost_price=product.cost_price or 0; product.cost_price=payload.cost_price
     if payload.supplier is not None: audit("supplier",ing.supplier,payload.supplier); ing.supplier=payload.supplier; lot.supplier=payload.supplier
     if payload.lot_number is not None: audit("lot_number",ing.lot_number,payload.lot_number); ing.lot_number=payload.lot_number; lot.lot_number=payload.lot_number
@@ -1286,13 +1290,25 @@ def get_pending_presales(branch_id: int = 1, db: Session = Depends(get_db)):
     return result
 
 @app.delete("/presales/{presale_id}")
-def delete_presale(presale_id: int, db: Session = Depends(get_db)):
-    ps = db.query(PreSaleDB).filter(PreSaleDB.id == presale_id).first()
-    if ps:
-        ps.status = "CANCELADA"
-        db.commit()
-        return {"status": "ok"}
-    raise HTTPException(status_code=404, detail="No encontrada")
+def delete_presale(
+    presale_id: int,
+    branch_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    ps = db.query(PreSaleDB).filter(
+        PreSaleDB.id == presale_id,
+        PreSaleDB.branch_id == branch_id
+    ).first()
+
+    if not ps:
+        raise HTTPException(
+            status_code=404,
+            detail="Preventa no encontrada en esta sucursal"
+        )
+
+    ps.status = "CANCELADA"
+    db.commit()
+    return {"status": "ok"}
 
 def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, actor: str, reason: str, db: Session, reference_type: Optional[str]=None, reference_id: Optional[int]=None, preferred_lot_id: Optional[int]=None, branch_id: int = 1):
     if quantity <= 0:
@@ -1365,6 +1381,21 @@ def open_cash(payload: CashOpenSchema, branch_id: int = 1, db: Session = Depends
 @app.post("/sales/finalize")
 def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session = Depends(get_db)):
     active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True,CashSessionDB.branch_id==branch_id).first()
+
+    presale = None
+    if payload.presale_id:
+        presale = db.query(PreSaleDB).filter(
+            PreSaleDB.id == payload.presale_id,
+            PreSaleDB.branch_id == branch_id,
+            PreSaleDB.status == "PENDIENTE"
+        ).first()
+
+        if not presale:
+            raise HTTPException(
+                status_code=409,
+                detail="La preventa no pertenece a esta sucursal o ya fue procesada"
+            )
+
     sale=SaleDB(branch_id=branch_id,presale_id=payload.presale_id, session_id=active.id if active else None, total_amount=payload.total_amount, amount_cash=payload.amount_cash, amount_mp=payload.amount_mp, payment_method=payload.payment_method, sold_by=payload.sold_by)
     db.add(sale); db.flush()
     products={}
@@ -1388,18 +1419,17 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
 
         unit_price=branch_config.price_per_unit if branch_config.price_per_unit is not None else (x.price_per_unit or 0)
 
-        if payload.presale_id:
+        if presale:
             psi=db.query(PreSaleItemDB).filter(
-                PreSaleItemDB.presale_id==payload.presale_id,
+                PreSaleItemDB.presale_id==presale.id,
                 PreSaleItemDB.product_id==x.id
             ).first()
             if psi:
                 unit_price=psi.price_per_unit or unit_price
         revenue=unit_price*item.quantity
         db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_price=unit_price, unit_cost=cost/item.quantity, cogs=cost, gross_profit=revenue-cost))
-    if payload.presale_id:
-        ps=db.query(PreSaleDB).filter(PreSaleDB.id==payload.presale_id).first()
-        if ps: ps.status="COMPLETADA"
+    if presale:
+        presale.status = "COMPLETADA"
     db.commit()
     return {"status":"success","message":"Venta procesada","sale_id":sale.id}
 

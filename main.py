@@ -484,66 +484,100 @@ def update_user_status(user_id: int, payload: UserStatusSchema, db: Session=Depe
     db.commit()
     return {"status":"success","user_id":u.id,"is_active":u.is_active}
 
-@app.get("/kpis/dashboard")
-def get_kpis_dashboard(db: Session = Depends(get_db)):
-    now = datetime.datetime.utcnow()
-    month_start = datetime.datetime(now.year, now.month, 1)
-    
-    first_this_month = month_start
-    last_month_last_day = first_this_month - datetime.timedelta(days=1)
-    prev_month_start = datetime.datetime(last_month_last_day.year, last_month_last_day.month, 1)
-
-    sales_this_month = db.query(SaleDB).filter(SaleDB.created_at >= month_start).all()
-    sales_prev_month = db.query(SaleDB).filter(SaleDB.created_at >= prev_month_start, SaleDB.created_at < month_start).all()
-
-    rev_this_month = sum(s.total_amount for s in sales_this_month)
-    rev_prev_month = sum(s.total_amount for s in sales_prev_month)
-
-    if rev_prev_month > 0:
-        pct_growth = round(((rev_this_month - rev_prev_month) / rev_prev_month) * 100.0, 1)
+def _kpi_period(period: str):
+    now=datetime.datetime.utcnow()
+    p=(period or "month").lower()
+    if p in ("week","weekly","semana","semanal"):
+        start=now-datetime.timedelta(days=7); label="week"
+    elif p in ("30d","30days","30dias"):
+        start=now-datetime.timedelta(days=30); label="30d"
     else:
-        pct_growth = 100.0 if rev_this_month > 0 else 0.0
+        start=datetime.datetime(now.year,now.month,1); label="month"
+    return start,now,label
 
-    thirty_days_ago = now - datetime.timedelta(days=30)
-    top_products_query = db.query(
-        SaleItemDB.product_name,
-        func.sum(SaleItemDB.quantity).label("total_qty")
-    ).join(SaleDB).filter(SaleDB.created_at >= thirty_days_ago).group_by(SaleItemDB.product_name).order_by(func.sum(SaleItemDB.quantity).desc()).limit(10).all()
+def _economic_cash_category(category: str):
+    c=(category or "").strip().upper()
+    if c in {"PROVEEDOR","PROVEEDORES","PAGO_PROVEEDOR","MERCADERIA","COMPRA_MERCADERIA","RETIRO_DUENO","RETIRO_DUEÑO","OWNER_WITHDRAWAL"}:
+        return None
+    if c in {"EMPLEADO","EMPLEADOS","PAGO_EMPLEADO","SUELDO","SUELDOS","SALARIO"}:
+        return "employee"
+    if c in {"SERVICIO","SERVICIOS","OPERATIVO","OPERATIVOS","GASTO_OPERATIVO","COMPRA_MENOR","CAJA_CHICA"}:
+        return "operating"
+    return "other"
 
-    top_products = [{"name": row[0] or "Producto", "total_qty": round(row[1], 2)} for row in top_products_query]
+def build_profitability(start: datetime.datetime, end: datetime.datetime, db: Session):
+    sales=db.query(SaleDB).filter(SaleDB.created_at>=start,SaleDB.created_at<end).all()
+    sale_ids=[x.id for x in sales]
+    items=db.query(SaleItemDB).filter(SaleItemDB.sale_id.in_(sale_ids)).all() if sale_ids else []
+    revenue=round(sum(float(x.total_amount or 0) for x in sales),2)
+    cogs=round(sum(float(x.cogs or 0) for x in items),2)
+    gross=round(revenue-cogs,2)
 
-    top_staff_query = db.query(
-        WorkLogDB.user_name,
-        func.count(WorkLogDB.id).label("shifts_count"),
-        func.sum(WorkLogDB.hours_worked).label("total_hours")
-    ).filter(WorkLogDB.clock_in >= thirty_days_ago).group_by(WorkLogDB.user_name).order_by(func.sum(WorkLogDB.hours_worked).desc()).limit(10).all()
+    losses=db.query(StockMovementDB).filter(
+        StockMovementDB.movement_type=="LOSS",
+        StockMovementDB.created_at>=start,StockMovementDB.created_at<end
+    ).all()
+    loss_cost=round(sum(abs(float(x.quantity or 0))*float(x.unit_cost or 0) for x in losses),2)
 
-    top_staff = [{"name": row[0], "shifts": row[1], "hours": round(row[2] or 0.0, 1)} for row in top_staff_query]
-
-    alerts_endpoint_data = get_system_alerts(db)
-    critical_alerts_count = sum(1 for a in alerts_endpoint_data if a["level"] == "CRITICAL")
-    warning_alerts_count = sum(1 for a in alerts_endpoint_data if a["level"] in ["WARNING", "HIGH"])
-
-    if pct_growth >= 0 and critical_alerts_count == 0:
-        health_status = "EXCELENTE"
-        summary_text = f"🟢 ¡Vamos bien! Las ventas crecieron un {pct_growth}% respecto al mes anterior y no tenés alertas críticas pendientes."
-    elif pct_growth >= 0 and critical_alerts_count > 0:
-        health_status = "ATENCION"
-        summary_text = f"⚠️ Las ventas crecieron (+{pct_growth}%), pero hay {critical_alerts_count} alerta(s) crítica(s) por revisar (revisar sección Alertas)."
-    else:
-        health_status = "ALERTA"
-        summary_text = f"🔴 Las ventas cayeron un {abs(pct_growth)}% respecto al mes anterior y hay {critical_alerts_count} alerta(s) crítica(s)."
-
+    movements=db.query(CashMovementDB).filter(
+        CashMovementDB.created_at>=start,CashMovementDB.created_at<end
+    ).all()
+    cash_in=round(sum(float(x.amount or 0) for x in movements if (x.movement_type or "").upper()=="IN"),2)
+    cash_out=round(sum(float(x.amount or 0) for x in movements if (x.movement_type or "").upper()=="OUT"),2)
+    operating=employee=other=0.0
+    supplier_payments=owner_withdrawals=0.0
+    for x in movements:
+        if (x.movement_type or "").upper()!="OUT": continue
+        cat=(x.category or "").strip().upper()
+        amount=float(x.amount or 0)
+        if cat in {"PROVEEDOR","PROVEEDORES","PAGO_PROVEEDOR","MERCADERIA","COMPRA_MERCADERIA"}:
+            supplier_payments+=amount; continue
+        if cat in {"RETIRO_DUENO","RETIRO_DUEÑO","OWNER_WITHDRAWAL"}:
+            owner_withdrawals+=amount; continue
+        bucket=_economic_cash_category(cat)
+        if bucket=="employee": employee+=amount
+        elif bucket=="operating": operating+=amount
+        else: other+=amount
+    operating=round(operating,2); employee=round(employee,2); other=round(other,2)
+    economic_expenses=round(loss_cost+operating+employee+other,2)
+    net=round(gross-economic_expenses,2)
     return {
-        "health_status": health_status,
-        "summary_text": summary_text,
-        "revenue_this_month": round(rev_this_month, 2),
-        "revenue_prev_month": round(rev_prev_month, 2),
-        "pct_growth": pct_growth,
-        "critical_alerts_count": critical_alerts_count,
-        "warning_alerts_count": warning_alerts_count,
-        "top_products": top_products,
-        "top_staff": top_staff
+        "sales_count":len(sales),"revenue":revenue,"cogs":cogs,"gross_profit":gross,
+        "gross_margin_pct":round((gross/revenue*100) if revenue else 0,2),
+        "losses_at_cost":loss_cost,"operating_expenses":operating,"employee_expenses":employee,
+        "other_expenses":other,"economic_expenses":economic_expenses,"net_profit":net,
+        "net_margin_pct":round((net/revenue*100) if revenue else 0,2),
+        "cash_flow":{"sales_cash":round(sum(float(x.amount_cash or 0) for x in sales),2),
+                     "sales_mp":round(sum(float(x.amount_mp or 0) for x in sales),2),
+                     "other_cash_in":cash_in,"cash_out":cash_out,
+                     "supplier_payments":round(supplier_payments,2),
+                     "owner_withdrawals":round(owner_withdrawals,2)}
+    }
+
+@app.get("/kpis/profitability")
+def get_profitability(period: str="month", db: Session=Depends(get_db)):
+    start,end,label=_kpi_period(period)
+    data=build_profitability(start,end,db)
+    return {"period":label,"from":start.isoformat(),"to":end.isoformat(),**data}
+
+@app.get("/kpis/dashboard")
+def get_kpis_dashboard(period: str="month", db: Session=Depends(get_db)):
+    start,end,label=_kpi_period(period)
+    data=build_profitability(start,end,db)
+    top=db.query(SaleItemDB.product_name,func.sum(SaleItemDB.quantity).label("qty")).join(SaleDB).filter(
+        SaleDB.created_at>=start,SaleDB.created_at<end
+    ).group_by(SaleItemDB.product_name).order_by(func.sum(SaleItemDB.quantity).desc()).limit(10).all()
+    alerts=get_system_alerts(db)
+    critical=sum(1 for a in alerts if a.get("level")=="CRITICAL")
+    important=sum(1 for a in alerts if a.get("level") in ("IMPORTANT","WARNING","HIGH"))
+    return {
+        "period":label,"from":start.isoformat(),"to":end.isoformat(),
+        "health_status":"ATENCION" if critical else "OK",
+        "summary_text":f"Resultado neto ${data['net_profit']:.2f}. Alertas criticas pendientes: {critical}.",
+        "revenue_this_month":data["revenue"],"critical_alerts_count":critical,
+        "warning_alerts_count":important,
+        "top_products":[{"name":x[0] or "Producto","total_qty":round(float(x[1] or 0),2)} for x in top],
+        **data
     }
 
 @app.post("/hr/shifts/start")

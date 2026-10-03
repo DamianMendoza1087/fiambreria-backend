@@ -57,6 +57,9 @@ class ProductDB(Base):
     last_counted_by = Column(String, nullable=True)
     barcode = Column(String, nullable=True)
     is_active = Column(Boolean, default=True)
+    brand = Column(String, nullable=True)
+    requires_expiration = Column(Boolean, default=False)
+    replenishment_policy = Column(String, default="MRP")
     lots = relationship("ProductLotDB", back_populates="product", cascade="all, delete-orphan")
 
 class ProductLotDB(Base):
@@ -234,17 +237,16 @@ def get_db():
     finally:
         db.close()
 
-def parse_date_to_iso(date_str: str) -> Optional[str]:
-    if not date_str:
+def parse_date_to_iso(date_str: Optional[str]) -> Optional[str]:
+    if date_str is None or not str(date_str).strip():
         return None
-    clean_str = date_str.strip().replace('/', '-')
-    parts = clean_str.split('-')
-    if len(parts) == 3:
-        if len(parts[0]) == 2 and len(parts[2]) == 4:
-            return f"{parts[2]}-{parts[1].zfill(2)}-{parts[0].zfill(2)}"
-        elif len(parts[0]) == 4 and len(parts[2]) == 2:
-            return f"{parts[0]}-{parts[1].zfill(2)}-{parts[2].zfill(2)}"
-    return clean_str
+    value = str(date_str).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.datetime.strptime(value, fmt).date().isoformat()
+        except ValueError:
+            pass
+    raise HTTPException(status_code=422, detail="Fecha de vencimiento invalida. Usa DD/MM/AAAA o AAAA-MM-DD.")
 
 def format_iso_to_ddmmyyyy(iso_str: str) -> str:
     if not iso_str:
@@ -315,11 +317,37 @@ class ProductCreateSchema(BaseModel):
     price_per_unit: float
     supplier: Optional[str] = None
     unit_type: Optional[str] = "unid"
-    stock: float
+    stock: float = 0.0
     barcode: Optional[str] = None
     is_active: Optional[bool] = True
     expiration_date: Optional[str] = None
     lot_number: Optional[str] = None
+    brand: Optional[str] = None
+    requires_expiration: Optional[bool] = False
+    replenishment_policy: Optional[str] = "MRP"
+    received_by: Optional[str] = "Anonimo"
+    notes: Optional[str] = None
+
+class ProductMasterSchema(BaseModel):
+    name: str
+    category: Optional[str] = "Varios"
+    brand: Optional[str] = None
+    barcode: Optional[str] = None
+    price_per_unit: float
+    unit_type: Optional[str] = "unid"
+    requires_expiration: bool = False
+    replenishment_policy: Optional[str] = "MRP"
+    is_active: bool = True
+
+class IngressCreateSchema(BaseModel):
+    product_id: int
+    supplier: Optional[str] = None
+    cost_price: float
+    quantity: float
+    lot_number: Optional[str] = None
+    expiration_date: Optional[str] = None
+    received_by: Optional[str] = "Anonimo"
+    notes: Optional[str] = None
 
 class CashOpenSchema(BaseModel):
     initial_amount: float
@@ -548,105 +576,136 @@ def compare_employees(email1: str, email2: str, days: int = 30, db: Session = De
 def get_products(db: Session = Depends(get_db)):
     return db.query(ProductDB).all()
 
+@app.get("/products/by-barcode/{barcode}")
+def get_product_by_barcode(barcode: str, db: Session = Depends(get_db)):
+    product = db.query(ProductDB).filter(ProductDB.barcode == barcode.strip()).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="EAN no asociado a ningun producto")
+    return product
+
+@app.get("/products/search")
+def search_products(q: str = "", db: Session = Depends(get_db)):
+    query = db.query(ProductDB).filter(ProductDB.is_active == True)
+    if q.strip():
+        query = query.filter(ProductDB.name.ilike(f"%{q.strip()}%"))
+    return query.order_by(ProductDB.name.asc()).limit(50).all()
+
+def normalize_barcode(value: Optional[str]) -> Optional[str]:
+    clean = str(value).strip() if value is not None else ""
+    return clean or None
+
+def register_ingress(product: ProductDB, supplier: Optional[str], cost_price: float, quantity: float,
+                     lot_number: Optional[str], expiration_date: Optional[str], received_by: Optional[str],
+                     notes: Optional[str], db: Session):
+    if quantity <= 0: raise HTTPException(status_code=422, detail="La cantidad debe ser mayor a cero")
+    if cost_price < 0: raise HTTPException(status_code=422, detail="El costo no puede ser negativo")
+    iso_exp = parse_date_to_iso(expiration_date)
+    if product.requires_expiration and not iso_exp:
+        raise HTTPException(status_code=422, detail="Este producto requiere vencimiento")
+    product.previous_cost_price = product.cost_price or 0.0
+    product.cost_price = cost_price
+    product.supplier = supplier or product.supplier
+    product.stock = (product.stock or 0.0) + quantity
+    product.is_active = True
+    lot=ProductLotDB(product_id=product.id,lot_number=lot_number or f"LOTE-{datetime.datetime.utcnow().strftime('%Y%m%d%H%M%S')}",supplier=supplier,cost_price=cost_price,initial_qty=quantity,current_qty=quantity,expiration_date=iso_exp)
+    db.add(lot); db.flush()
+    ing=ProductIngressDB(product_id=product.id,supplier=supplier,cost_price=cost_price,quantity=quantity,lot_number=lot.lot_number,expiration_date=iso_exp,received_by=received_by,notes=notes)
+    db.add(ing); db.flush()
+    db.add(StockMovementDB(product_id=product.id,lot_id=lot.id,movement_type="INGRESS",quantity=quantity,unit_cost=cost_price,reason="Ingreso de mercaderia",actor=received_by,reference_type="product_ingress",reference_id=ing.id,notes=notes))
+    return ing,lot
+
+@app.post("/products/master")
+def create_product_master(prod: ProductMasterSchema, db: Session = Depends(get_db)):
+    barcode=normalize_barcode(prod.barcode)
+    if barcode and db.query(ProductDB).filter(ProductDB.barcode==barcode).first():
+        raise HTTPException(status_code=409,detail="Ese EAN ya existe")
+    if db.query(ProductDB).filter(func.lower(ProductDB.name)==prod.name.strip().lower()).first():
+        raise HTTPException(status_code=409,detail="Ya existe un producto con ese nombre")
+    x=ProductDB(name=prod.name.strip(),category=prod.category or "Varios",brand=prod.brand,barcode=barcode,price_per_unit=prod.price_per_unit,unit_type=prod.unit_type or "unid",stock=0,cost_price=0,previous_cost_price=0,requires_expiration=prod.requires_expiration,replenishment_policy=prod.replenishment_policy or "MRP",is_active=prod.is_active)
+    db.add(x); db.commit(); db.refresh(x); return x
+
+@app.post("/ingresses")
+def create_ingress(payload: IngressCreateSchema, db: Session = Depends(get_db)):
+    product=db.query(ProductDB).filter(ProductDB.id==payload.product_id).first()
+    if not product: raise HTTPException(status_code=404,detail="Producto no encontrado")
+    ing,lot=register_ingress(product,payload.supplier,payload.cost_price,payload.quantity,payload.lot_number,payload.expiration_date,payload.received_by,payload.notes,db)
+    db.commit(); db.refresh(ing)
+    return {"status":"success","ingress_id":ing.id,"lot_id":lot.id,"product_id":product.id,"stock":product.stock}
+
+@app.get("/ingresses")
+def get_ingresses(product_id: Optional[int]=None, db: Session=Depends(get_db)):
+    q=db.query(ProductIngressDB)
+    if product_id is not None: q=q.filter(ProductIngressDB.product_id==product_id)
+    return q.order_by(ProductIngressDB.id.desc()).limit(200).all()
+
+@app.get("/stock/movements")
+def get_stock_movements(product_id: Optional[int]=None, db: Session=Depends(get_db)):
+    q=db.query(StockMovementDB)
+    if product_id is not None: q=q.filter(StockMovementDB.product_id==product_id)
+    return q.order_by(StockMovementDB.id.desc()).limit(500).all()
+
 @app.post("/products")
 def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db)):
-    existing = None
-    if prod.barcode:
-        existing = db.query(ProductDB).filter(ProductDB.barcode == prod.barcode).first()
-    if not existing:
-        existing = db.query(ProductDB).filter(ProductDB.name == prod.name).first()
-
-    iso_expiration = parse_date_to_iso(prod.expiration_date)
-
+    barcode=normalize_barcode(prod.barcode)
+    existing=db.query(ProductDB).filter(ProductDB.barcode==barcode).first() if barcode else None
+    if not existing: existing=db.query(ProductDB).filter(func.lower(ProductDB.name)==prod.name.strip().lower()).first()
     if existing:
-        existing.previous_cost_price = existing.cost_price or 0.0
-        existing.stock += prod.stock
-        existing.cost_price = prod.cost_price or existing.cost_price
-        existing.supplier = prod.supplier or existing.supplier
-        existing.price_per_unit = prod.price_per_unit or existing.price_per_unit
-        existing.is_active = True
-        p_target = existing
+        if barcode and existing.barcode and existing.barcode!=barcode: raise HTTPException(status_code=409,detail="Nombre coincide con producto de otro EAN")
+        if barcode and not existing.barcode:
+            other=db.query(ProductDB).filter(ProductDB.barcode==barcode,ProductDB.id!=existing.id).first()
+            if other: raise HTTPException(status_code=409,detail="EAN ya asociado")
+            existing.barcode=barcode
+        existing.name=prod.name.strip(); existing.category=prod.category or existing.category
+        existing.brand=prod.brand if prod.brand is not None else existing.brand
+        existing.price_per_unit=prod.price_per_unit; existing.unit_type=prod.unit_type or existing.unit_type
+        existing.requires_expiration=bool(prod.requires_expiration); existing.replenishment_policy=prod.replenishment_policy or "MRP"
+        target=existing
     else:
-        p_target = ProductDB(
-            name=prod.name,
-            category=prod.category,
-            cost_price=prod.cost_price or 0.0,
-            previous_cost_price=prod.cost_price or 0.0,
-            price_per_unit=prod.price_per_unit,
-            supplier=prod.supplier,
-            unit_type=prod.unit_type,
-            stock=prod.stock,
-            barcode=prod.barcode,
-            is_active=True
-        )
-        db.add(p_target); db.flush()
-
-    if iso_expiration:
-        lot = ProductLotDB(
-            product_id=p_target.id,
-            lot_number=prod.lot_number or f"LOTE-{datetime.date.today().strftime('%Y%m%d')}",
-            supplier=prod.supplier,
-            cost_price=prod.cost_price or 0.0,
-            initial_qty=prod.stock,
-            current_qty=prod.stock,
-            expiration_date=iso_expiration
-        )
-        db.add(lot)
-
-    db.commit(); db.refresh(p_target)
-    return p_target
+        target=ProductDB(name=prod.name.strip(),category=prod.category or "Varios",brand=prod.brand,cost_price=0,previous_cost_price=0,price_per_unit=prod.price_per_unit,supplier=prod.supplier,unit_type=prod.unit_type or "unid",stock=0,barcode=barcode,requires_expiration=bool(prod.requires_expiration),replenishment_policy=prod.replenishment_policy or "MRP",is_active=True)
+        db.add(target); db.flush()
+    if prod.stock>0: register_ingress(target,prod.supplier,prod.cost_price or 0,prod.stock,prod.lot_number,prod.expiration_date,prod.received_by,prod.notes,db)
+    db.commit(); db.refresh(target); return target
 
 @app.put("/products/{product_id}")
-def update_product(product_id: int, prod: ProductCreateSchema, db: Session = Depends(get_db)):
-    p = db.query(ProductDB).filter(ProductDB.id == product_id).first()
-    if not p:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-    
-    if prod.cost_price and prod.cost_price != p.cost_price:
-        p.previous_cost_price = p.cost_price
-        p.cost_price = prod.cost_price
-
-    p.name = prod.name
-    p.category = prod.category
-    p.price_per_unit = prod.price_per_unit
-    p.supplier = prod.supplier
-    p.unit_type = prod.unit_type
-    p.stock = prod.stock
-    p.barcode = prod.barcode
-    p.is_active = prod.is_active if prod.is_active is not None else p.is_active
-    
-    db.commit(); db.refresh(p)
-    return p
+def update_product(product_id:int, prod:ProductCreateSchema, db:Session=Depends(get_db)):
+    x=db.query(ProductDB).filter(ProductDB.id==product_id).first()
+    if not x: raise HTTPException(status_code=404,detail="Producto no encontrado")
+    barcode=normalize_barcode(prod.barcode)
+    if barcode and db.query(ProductDB).filter(ProductDB.barcode==barcode,ProductDB.id!=product_id).first():
+        raise HTTPException(status_code=409,detail="EAN ya asociado a otro producto")
+    old_price=x.price_per_unit
+    changes={"name":(x.name,prod.name.strip()),"category":(x.category,prod.category),"brand":(x.brand,prod.brand),"price_per_unit":(x.price_per_unit,prod.price_per_unit),"supplier":(x.supplier,prod.supplier),"unit_type":(x.unit_type,prod.unit_type),"barcode":(x.barcode,barcode),"requires_expiration":(x.requires_expiration,bool(prod.requires_expiration)),"replenishment_policy":(x.replenishment_policy,prod.replenishment_policy or "MRP")}
+    x.name=prod.name.strip(); x.category=prod.category; x.brand=prod.brand; x.price_per_unit=prod.price_per_unit
+    x.supplier=prod.supplier; x.unit_type=prod.unit_type; x.barcode=barcode; x.requires_expiration=bool(prod.requires_expiration); x.replenishment_policy=prod.replenishment_policy or "MRP"
+    x.is_active=prod.is_active if prod.is_active is not None else x.is_active
+    actor=prod.received_by or "Anonimo"
+    for field,(old,new) in changes.items():
+        if old!=new: db.add(AuditEventDB(entity_type="product",entity_id=x.id,field_name=field,old_value=str(old),new_value=str(new),actor=actor,reason=prod.notes or "Edicion de producto"))
+    if old_price!=x.price_per_unit: db.add(PriceHistoryDB(product_id=x.id,old_price=old_price,new_price=x.price_per_unit,changed_by=actor,reason=prod.notes or "Cambio de PVP"))
+    db.commit(); db.refresh(x); return x
 
 @app.get("/products/{product_id}/lots")
-def get_product_lots(product_id: int, db: Session = Depends(get_db)):
-    lots = db.query(ProductLotDB).filter(ProductLotDB.product_id == product_id, ProductLotDB.current_qty > 0).order_by(ProductLotDB.expiration_date.asc()).all()
-    res = []
-    for l in lots:
-        res.append({
-            "id": l.id,
-            "lot_number": l.lot_number,
-            "supplier": l.supplier,
-            "current_qty": l.current_qty,
-            "expiration_date": format_iso_to_ddmmyyyy(l.expiration_date)
-        })
-    return res
+def get_product_lots(product_id:int,db:Session=Depends(get_db)):
+    lots=db.query(ProductLotDB).filter(ProductLotDB.product_id==product_id,ProductLotDB.current_qty>0).order_by(ProductLotDB.expiration_date.is_(None),ProductLotDB.expiration_date.asc(),ProductLotDB.created_at.asc()).all()
+    return [{"id":l.id,"lot_number":l.lot_number,"supplier":l.supplier,"cost_price":l.cost_price,"initial_qty":l.initial_qty,"current_qty":l.current_qty,"expiration_date":format_iso_to_ddmmyyyy(l.expiration_date)} for l in lots]
 
 @app.post("/products/{product_id}/audit")
-def audit_product_stock(product_id: int, audit: AuditSchema, db: Session = Depends(get_db)):
-    p = db.query(ProductDB).filter(ProductDB.id == product_id).first()
-    if not p:
-        raise HTTPException(status_code=404, detail="Producto no encontrado")
-    p.last_counted_qty = audit.counted_qty
-    p.last_counted_by = audit.reported_by
-    db.commit()
-    return {"status": "ok", "message": "Conteo físico guardado"}
+def audit_product_stock(product_id:int,audit:AuditSchema,db:Session=Depends(get_db)):
+    x=db.query(ProductDB).filter(ProductDB.id==product_id).first()
+    if not x: raise HTTPException(status_code=404,detail="Producto no encontrado")
+    if audit.counted_qty<0: raise HTTPException(status_code=422,detail="Conteo negativo")
+    old=x.stock or 0; diff=audit.counted_qty-old; x.last_counted_qty=audit.counted_qty; x.last_counted_by=audit.reported_by
+    if abs(diff)>0.000001:
+        x.stock=audit.counted_qty
+        db.add(StockMovementDB(product_id=x.id,movement_type="ADJUSTMENT",quantity=diff,unit_cost=x.cost_price or 0,reason="Ajuste por conteo fisico",actor=audit.reported_by))
+        db.add(AuditEventDB(entity_type="product",entity_id=x.id,field_name="stock",old_value=str(old),new_value=str(audit.counted_qty),actor=audit.reported_by,reason="Conteo fisico"))
+    db.commit(); return {"status":"ok","difference":diff,"stock":x.stock}
 
 @app.delete("/products/{product_id}")
-def delete_product(product_id: int, db: Session = Depends(get_db)):
-    p = db.query(ProductDB).filter(ProductDB.id == product_id).first()
-    if p: p.is_active = False; db.commit(); return {"status": "ok"}
-    raise HTTPException(status_code=404, detail="No encontrado")
+def delete_product(product_id:int,db:Session=Depends(get_db)):
+    x=db.query(ProductDB).filter(ProductDB.id==product_id).first()
+    if not x: raise HTTPException(status_code=404,detail="No encontrado")
+    x.is_active=False; db.commit(); return {"status":"ok"}
 
 @app.post("/presales")
 def create_presale(payload: PreSaleCreateSchema, db: Session = Depends(get_db)):

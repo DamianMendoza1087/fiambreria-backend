@@ -20,7 +20,7 @@ class UserDB(Base):
     name = Column(String, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    role = Column(String, default="vendedor")  # 'superadmin', 'dueno', 'vendedor'
+    role = Column(String, default="vendedor")  # 'masteradmin', 'superadmin', 'dueno', 'vendedor'
     is_active = Column(Boolean, default=False)
     can_preventa = Column(Boolean, default=True)
     can_caja = Column(Boolean, default=False)
@@ -446,6 +446,12 @@ class ProductMasterSchema(BaseModel):
     replenishment_policy: Optional[str] = "MRP"
     is_active: bool = True
 
+class BranchProductConfigSchema(BaseModel):
+    price_per_unit: Optional[float] = None
+    is_available: bool = True
+    is_exclusive: bool = False
+
+
 class IngressCreateSchema(BaseModel):
     product_id: int
     supplier: Optional[str] = None
@@ -518,6 +524,23 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     user = db.query(UserDB).filter(UserDB.email == form_data.username).first()
     if not user or user.hashed_password != form_data.password:
         raise HTTPException(status_code=400, detail="Credenciales incorrectas")
+
+    # Cuenta maestra protegida del sistema
+    if user.email.lower() == "admin@fiambreria.com":
+        changed = False
+        if user.role != "masteradmin":
+            user.role = "masteradmin"
+            changed = True
+        if not user.is_active:
+            user.is_active = True
+            changed = True
+        if not user.can_edit_records:
+            user.can_edit_records = True
+            changed = True
+        if changed:
+            db.commit()
+            db.refresh(user)
+
     return {
         "access_token": f"token-{user.id}",
         "token_type": "bearer",
@@ -559,7 +582,20 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
 def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends(get_db)):
     u=db.query(UserDB).filter(UserDB.id==user_id).first()
     if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
-    if p.role is not None:
+
+    # Admin Maestro: cuenta reservada e indegradable
+    if u.email.lower() == "admin@fiambreria.com":
+        if p.role is not None and p.role != "masteradmin":
+            raise HTTPException(status_code=403, detail="El Admin Maestro no puede ser degradado")
+        if p.is_active is False:
+            raise HTTPException(status_code=403, detail="El Admin Maestro no puede ser deshabilitado")
+        u.role = "masteradmin"
+        u.is_active = True
+        u.can_edit_records = True
+
+    if p.role is not None and u.email.lower() != "admin@fiambreria.com":
+        if p.role not in ("superadmin", "dueno", "vendedor"):
+            raise HTTPException(status_code=400, detail="Rol invalido")
         u.role=p.role
         if p.role=="superadmin": u.can_edit_records=True
     if p.is_active is not None: u.is_active=p.is_active
@@ -579,6 +615,8 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
 def update_user_status(user_id: int, payload: UserStatusSchema, db: Session=Depends(get_db)):
     u=db.query(UserDB).filter(UserDB.id==user_id).first()
     if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
+    if u.email.lower() == "admin@fiambreria.com" and not payload.is_active:
+        raise HTTPException(status_code=403, detail="El Admin Maestro no puede ser deshabilitado")
     u.is_active=payload.is_active
     db.commit()
     return {"status":"success","user_id":u.id,"is_active":u.is_active}
@@ -742,23 +780,83 @@ def compare_employees(emails: str="", days: int=30, db: Session=Depends(get_db),
         if email not in unique: unique.append(email)
     return {"days":days,"count":len(unique),"employees":[get_employee_stats(email,days,db) for email in unique]}
 
+def branch_product_view(product: ProductDB, branch_id: int, db: Session):
+    config = db.query(BranchProductDB).filter(
+        BranchProductDB.branch_id == branch_id,
+        BranchProductDB.product_id == product.id
+    ).first()
+
+    # Compatibilidad histórica: todos los productos existentes pertenecen
+    # inicialmente a Fiambrería Local.
+    if branch_id == 1 and not config:
+        config = BranchProductDB(
+            branch_id=1,
+            product_id=product.id,
+            price_per_unit=product.price_per_unit,
+            is_available=product.is_active,
+            is_exclusive=False
+        )
+        db.add(config)
+        db.flush()
+
+    if not config or not config.is_available:
+        return None
+
+    data = {c.name: getattr(product, c.name) for c in ProductDB.__table__.columns}
+    data["stock"] = get_branch_stock(db, product.id, branch_id)
+    data["price_per_unit"] = (
+        config.price_per_unit
+        if config.price_per_unit is not None
+        else product.price_per_unit
+    )
+    data["branch_id"] = branch_id
+    data["is_exclusive"] = bool(config.is_exclusive)
+    return data
+
+
 @app.get("/products")
-def get_products(db: Session = Depends(get_db)):
-    return db.query(ProductDB).all()
+def get_products(branch_id: int = 1, db: Session = Depends(get_db)):
+    products = db.query(ProductDB).filter(ProductDB.is_active == True).order_by(ProductDB.name.asc()).all()
+    result = []
+    for product in products:
+        view = branch_product_view(product, branch_id, db)
+        if view:
+            result.append(view)
+    db.commit()
+    return result
+
 
 @app.get("/products/by-barcode/{barcode}")
-def get_product_by_barcode(barcode: str, db: Session = Depends(get_db)):
+def get_product_by_barcode(barcode: str, branch_id: int = 1, db: Session = Depends(get_db)):
     product = db.query(ProductDB).filter(ProductDB.barcode == barcode.strip()).first()
     if not product:
         raise HTTPException(status_code=404, detail="EAN no asociado a ningun producto")
-    return product
+
+    view = branch_product_view(product, branch_id, db)
+    if not view:
+        raise HTTPException(status_code=404, detail="Producto no disponible en esta sucursal")
+
+    db.commit()
+    return view
+
 
 @app.get("/products/search")
-def search_products(q: str = "", db: Session = Depends(get_db)):
+def search_products(q: str = "", branch_id: int = 1, db: Session = Depends(get_db)):
     query = db.query(ProductDB).filter(ProductDB.is_active == True)
+
     if q.strip():
         query = query.filter(ProductDB.name.ilike(f"%{q.strip()}%"))
-    return query.order_by(ProductDB.name.asc()).limit(50).all()
+
+    result = []
+    for product in query.order_by(ProductDB.name.asc()).limit(100).all():
+        view = branch_product_view(product, branch_id, db)
+        if view:
+            result.append(view)
+        if len(result) >= 50:
+            break
+
+    db.commit()
+    return result
 
 def normalize_barcode(value: Optional[str]) -> Optional[str]:
     clean = str(value).strip() if value is not None else ""
@@ -783,6 +881,150 @@ def register_ingress(product: ProductDB, supplier: Optional[str], cost_price: fl
     db.add(ing); db.flush()
     db.add(StockMovementDB(branch_id=branch_id,product_id=product.id,lot_id=lot.id,movement_type="INGRESS",quantity=quantity,unit_cost=cost_price,reason="Ingreso de mercaderia",actor=received_by,reference_type="product_ingress",reference_id=ing.id,notes=notes))
     return ing,lot
+
+@app.get("/branches/{branch_id}/products")
+def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
+    branch = db.query(BranchDB).filter(
+        BranchDB.id == branch_id,
+        BranchDB.is_active == True
+    ).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Sucursal no encontrada")
+
+    products = db.query(ProductDB).filter(
+        ProductDB.is_active == True
+    ).order_by(ProductDB.name.asc()).all()
+
+    result = []
+
+    for product in products:
+        config = db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id == branch_id,
+            BranchProductDB.product_id == product.id
+        ).first()
+
+        # La sucursal principal conserva compatibilidad con catálogo histórico.
+        if branch_id == 1 and not config:
+            config = BranchProductDB(
+                branch_id=1,
+                product_id=product.id,
+                price_per_unit=product.price_per_unit,
+                is_available=True,
+                is_exclusive=False
+            )
+            db.add(config)
+            db.flush()
+
+        result.append({
+            "product_id": product.id,
+            "name": product.name,
+            "category": product.category,
+            "brand": product.brand,
+            "barcode": product.barcode,
+            "unit_type": product.unit_type,
+            "base_price": product.price_per_unit,
+            "branch_price": (
+                config.price_per_unit
+                if config and config.price_per_unit is not None
+                else product.price_per_unit
+            ),
+            "stock": get_branch_stock(db, product.id, branch_id),
+            "is_available": bool(config.is_available) if config else False,
+            "is_exclusive": bool(config.is_exclusive) if config else False,
+            "branch_id": branch_id
+        })
+
+    db.commit()
+    return result
+
+
+@app.put("/branches/{branch_id}/products/{product_id}")
+def configure_branch_product(
+    branch_id: int,
+    product_id: int,
+    payload: BranchProductConfigSchema,
+    db: Session = Depends(get_db)
+):
+    branch = db.query(BranchDB).filter(
+        BranchDB.id == branch_id,
+        BranchDB.is_active == True
+    ).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Sucursal no encontrada")
+
+    product = db.query(ProductDB).filter(
+        ProductDB.id == product_id,
+        ProductDB.is_active == True
+    ).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+
+    if payload.price_per_unit is not None and payload.price_per_unit < 0:
+        raise HTTPException(status_code=422, detail="El precio no puede ser negativo")
+
+    config = db.query(BranchProductDB).filter(
+        BranchProductDB.branch_id == branch_id,
+        BranchProductDB.product_id == product_id
+    ).first()
+
+    if not config:
+        config = BranchProductDB(
+            branch_id=branch_id,
+            product_id=product_id
+        )
+        db.add(config)
+
+    config.price_per_unit = (
+        payload.price_per_unit
+        if payload.price_per_unit is not None
+        else product.price_per_unit
+    )
+    config.is_available = payload.is_available
+    config.is_exclusive = payload.is_exclusive
+
+    db.commit()
+    db.refresh(config)
+
+    return {
+        "status": "success",
+        "branch_id": branch_id,
+        "product_id": product_id,
+        "price_per_unit": config.price_per_unit,
+        "is_available": config.is_available,
+        "is_exclusive": config.is_exclusive,
+        "stock": get_branch_stock(db, product_id, branch_id)
+    }
+
+
+@app.delete("/branches/{branch_id}/products/{product_id}")
+def remove_product_from_branch(
+    branch_id: int,
+    product_id: int,
+    db: Session = Depends(get_db)
+):
+    config = db.query(BranchProductDB).filter(
+        BranchProductDB.branch_id == branch_id,
+        BranchProductDB.product_id == product_id
+    ).first()
+
+    if not config:
+        raise HTTPException(
+            status_code=404,
+            detail="Producto no configurado en esta sucursal"
+        )
+
+    # No se elimina el producto maestro ni su historial.
+    config.is_available = False
+
+    db.commit()
+
+    return {
+        "status": "success",
+        "branch_id": branch_id,
+        "product_id": product_id,
+        "is_available": False
+    }
+
 
 @app.post("/products/master")
 def create_product_master(prod: ProductMasterSchema, db: Session = Depends(get_db)):
@@ -927,32 +1169,52 @@ def delete_product(product_id:int,db:Session=Depends(get_db)):
     x.is_active=False; db.commit(); return {"status":"ok"}
 
 @app.post("/presales")
-def create_presale(payload: PreSaleCreateSchema, db: Session = Depends(get_db)):
+def create_presale(payload: PreSaleCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):
     total = 0.0
-    presale = PreSaleDB(status="PENDIENTE", created_by=payload.created_by)
+    presale = PreSaleDB(branch_id=branch_id, status="PENDIENTE", created_by=payload.created_by)
     db.add(presale); db.flush()
 
     for item in payload.items:
         prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
-        if prod:
-            subtotal = prod.price_per_unit * item.quantity
-            total += subtotal
-            db.add(PreSaleItemDB(
-                presale_id=presale.id,
-                product_id=prod.id,
-                product_name=prod.name,
-                price_per_unit=prod.price_per_unit,
-                unit_type=prod.unit_type,
-                quantity=item.quantity
-            ))
+        if not prod:
+            raise HTTPException(status_code=404, detail=f"Producto {item.product_id} no encontrado")
+
+        config = db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id == branch_id,
+            BranchProductDB.product_id == prod.id,
+            BranchProductDB.is_available == True
+        ).first()
+
+        if not config:
+            raise HTTPException(status_code=409, detail=f"{prod.name} no esta habilitado en esta sucursal")
+
+        if get_branch_stock(db, prod.id, branch_id) < item.quantity:
+            raise HTTPException(status_code=409, detail=f"Stock insuficiente: {prod.name}")
+
+        unit_price = config.price_per_unit if config.price_per_unit is not None else prod.price_per_unit
+        subtotal = unit_price * item.quantity
+        total += subtotal
+
+        db.add(PreSaleItemDB(
+            presale_id=presale.id,
+            product_id=prod.id,
+            product_name=prod.name,
+            price_per_unit=unit_price,
+            unit_type=prod.unit_type,
+            quantity=item.quantity
+        ))
 
     presale.total_amount = total
     db.commit()
     return {"status": "success", "presale_id": presale.id, "total": total}
 
+
 @app.get("/presales/pending")
-def get_pending_presales(db: Session = Depends(get_db)):
-    presales = db.query(PreSaleDB).filter(PreSaleDB.status == "PENDIENTE").all()
+def get_pending_presales(branch_id: int = 1, db: Session = Depends(get_db)):
+    presales = db.query(PreSaleDB).filter(
+        PreSaleDB.status == "PENDIENTE",
+        PreSaleDB.branch_id == branch_id
+    ).all()
     result = []
     for ps in presales:
         items = [{"product_id": i.product_id, "name": i.product_name, "price_per_unit": i.price_per_unit, "unit_type": i.unit_type, "qty": i.quantity} for i in ps.items]
@@ -1052,10 +1314,23 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
     for item in payload.items:
         x=products[item.product_id]
         cost=consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta", db, "sale", sale.id, branch_id=branch_id)
-        unit_price=x.price_per_unit or 0
+        branch_config=db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id==branch_id,
+            BranchProductDB.product_id==x.id,
+            BranchProductDB.is_available==True
+        ).first()
+        if not branch_config:
+            raise HTTPException(status_code=409, detail=f"{x.name} no esta habilitado en esta sucursal")
+
+        unit_price=branch_config.price_per_unit if branch_config.price_per_unit is not None else (x.price_per_unit or 0)
+
         if payload.presale_id:
-            psi=db.query(PreSaleItemDB).filter(PreSaleItemDB.presale_id==payload.presale_id,PreSaleItemDB.product_id==x.id).first()
-            if psi: unit_price=psi.price_per_unit or unit_price
+            psi=db.query(PreSaleItemDB).filter(
+                PreSaleItemDB.presale_id==payload.presale_id,
+                PreSaleItemDB.product_id==x.id
+            ).first()
+            if psi:
+                unit_price=psi.price_per_unit or unit_price
         revenue=unit_price*item.quantity
         db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_price=unit_price, unit_cost=cost/item.quantity, cogs=cost, gross_profit=revenue-cost))
     if payload.presale_id:

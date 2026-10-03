@@ -1166,13 +1166,31 @@ def get_ingresses(product_id: Optional[int]=None, branch_id: int = 1, db: Sessio
     return q.order_by(ProductIngressDB.id.desc()).limit(200).all()
 
 @app.patch("/ingresses/{ingress_id}")
-def correct_ingress(ingress_id: int, payload: IngressCorrectionSchema, db: Session=Depends(get_db)):
-    if not payload.reason.strip(): raise HTTPException(status_code=422,detail="El motivo de la correccion es obligatorio")
-    ing=db.query(ProductIngressDB).filter(ProductIngressDB.id==ingress_id).first()
+def correct_ingress(
+    ingress_id: int,
+    payload: IngressCorrectionSchema,
+    branch_id: int = 1,
+    db: Session=Depends(get_db)
+):
+    if not payload.reason.strip():
+        raise HTTPException(status_code=422,detail="El motivo de la correccion es obligatorio")
+
+    ing=db.query(ProductIngressDB).filter(
+        ProductIngressDB.id==ingress_id,
+        ProductIngressDB.branch_id==branch_id
+    ).first()
     if not ing: raise HTTPException(status_code=404,detail="Ingreso no encontrado")
     product=db.query(ProductDB).filter(ProductDB.id==ing.product_id).first()
-    movement=db.query(StockMovementDB).filter(StockMovementDB.reference_type=="product_ingress",StockMovementDB.reference_id==ing.id).order_by(StockMovementDB.id.asc()).first()
-    lot=db.query(ProductLotDB).filter(ProductLotDB.id==movement.lot_id).first() if movement and movement.lot_id else None
+    movement=db.query(StockMovementDB).filter(
+        StockMovementDB.reference_type=="product_ingress",
+        StockMovementDB.reference_id==ing.id,
+        StockMovementDB.branch_id==branch_id
+    ).order_by(StockMovementDB.id.asc()).first()
+
+    lot=db.query(ProductLotDB).filter(
+        ProductLotDB.id==movement.lot_id,
+        ProductLotDB.branch_id==branch_id
+    ).first() if movement and movement.lot_id else None
     if not product or not lot: raise HTTPException(status_code=409,detail="El ingreso no tiene lote trazable y no puede corregirse automaticamente")
     changes=[]
     def audit(field,old,new):

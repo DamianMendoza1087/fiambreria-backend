@@ -32,6 +32,7 @@ class UserDB(Base):
     can_verificacion = Column(Boolean, default=False)
     can_kpis = Column(Boolean, default=False)
     can_edit_records = Column(Boolean, default=False)  # Controla si el dueño/usuario puede editar/eliminar registros
+    branch_id = Column(Integer, default=1, index=True)  # Sucursal de trabajo predeterminada
 
 class BranchDB(Base):
     __tablename__ = "branches"
@@ -274,6 +275,12 @@ ensure_v2_schema()
 def ensure_multilocal_schema():
     Base.metadata.create_all(bind=engine)
 
+    # Los empleados comunes tienen una sucursal de trabajo predeterminada.
+    user_cols = {c["name"] for c in inspect(engine).get_columns("users")}
+    if "branch_id" not in user_cols:
+        conn.execute(text("ALTER TABLE users ADD COLUMN branch_id INTEGER DEFAULT 1"))
+    conn.execute(text("UPDATE users SET branch_id=1 WHERE branch_id IS NULL"))
+
     tables = [
         "product_lots",
         "product_ingresses",
@@ -399,6 +406,7 @@ class PermissionsSchema(BaseModel):
     can_verificacion: Optional[bool] = None
     can_kpis: Optional[bool] = None
     can_edit_records: Optional[bool] = None
+    branch_id: Optional[int] = None
 
 class ItemSchema(BaseModel):
     product_id: int
@@ -555,7 +563,8 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         "can_mrp": user.can_mrp,
         "can_verificacion": user.can_verificacion,
         "can_kpis": user.can_kpis,
-        "can_edit_records": user.can_edit_records
+        "can_edit_records": user.can_edit_records,
+        "branch_id": user.branch_id or 1
     }
 
 @app.get("/users")
@@ -573,7 +582,8 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
         is_active=False,
         can_preventa=True, can_caja=False, can_stock=False, can_ingreso=False,
         can_alertas=False, can_rrhh=False, can_mrp=False, can_verificacion=False, can_kpis=False,
-        can_edit_records=(role in ["superadmin", "dueno"])
+        can_edit_records=(role in ["superadmin", "dueno"]),
+        branch_id=int(user_data.get("branch_id", 1) or 1)
     )
     db.add(new_u); db.commit(); db.refresh(new_u)
     return new_u
@@ -609,6 +619,10 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
     if p.can_verificacion is not None: u.can_verificacion=p.can_verificacion
     if p.can_kpis is not None: u.can_kpis=p.can_kpis
     if p.can_edit_records is not None: u.can_edit_records=p.can_edit_records
+    if p.branch_id is not None:
+        if p.branch_id not in (1, 2):
+            raise HTTPException(status_code=400, detail="Sucursal invalida")
+        u.branch_id=p.branch_id
     db.commit(); db.refresh(u); return u
 
 @app.patch("/users/{user_id}/status")

@@ -239,6 +239,17 @@ class CashSessionDB(Base):
     difference = Column(Float, nullable=True)
     status_message = Column(String, nullable=True)
 
+class InventoryCountDB(Base):
+    __tablename__ = "inventory_counts"
+    id = Column(Integer, primary_key=True, index=True)
+    branch_id = Column(Integer, index=True, default=1)
+    product_id = Column(Integer, ForeignKey("products.id"), index=True, nullable=False)
+    system_qty = Column(Float, default=0.0)
+    counted_qty = Column(Float, default=0.0)
+    difference = Column(Float, default=0.0)
+    reported_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 def ensure_v2_schema():
@@ -275,11 +286,13 @@ ensure_v2_schema()
 def ensure_multilocal_schema():
     Base.metadata.create_all(bind=engine)
 
-    # Los empleados comunes tienen una sucursal de trabajo predeterminada.
     user_cols = {c["name"] for c in inspect(engine).get_columns("users")}
-    if "branch_id" not in user_cols:
-        conn.execute(text("ALTER TABLE users ADD COLUMN branch_id INTEGER DEFAULT 1"))
-    conn.execute(text("UPDATE users SET branch_id=1 WHERE branch_id IS NULL"))
+
+    with engine.begin() as conn:
+        if "branch_id" not in user_cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN branch_id INTEGER DEFAULT 1"))
+
+        conn.execute(text("UPDATE users SET branch_id=1 WHERE branch_id IS NULL"))
 
     tables = [
         "product_lots",
@@ -1372,6 +1385,17 @@ def audit_product_stock(
             branch_id=branch_id
         )
 
+    # Crear siempre un registro InventoryCountDB, incluso si difference == 0
+    count_record = InventoryCountDB(
+        branch_id=branch_id,
+        product_id=x.id,
+        system_qty=old,
+        counted_qty=audit.counted_qty,
+        difference=round(diff, 6),
+        reported_by=audit.reported_by
+    )
+    db.add(count_record)
+
     if abs(diff) > 0.000001:
         db.add(AuditEventDB(
             entity_type="product",
@@ -1384,15 +1408,53 @@ def audit_product_stock(
         ))
 
     db.commit()
+    db.refresh(count_record)
 
     branch_stock = get_branch_stock(db, product_id, branch_id)
 
     return {
         "status": "ok",
         "branch_id": branch_id,
+        "system_qty": round(old, 6),
+        "counted_qty": round(audit.counted_qty, 6),
         "difference": round(diff, 6),
         "stock": round(branch_stock, 6),
-        "lots_stock": round(branch_stock, 6)
+        "lots_stock": round(branch_stock, 6),
+        "reported_by": count_record.reported_by,
+        "counted_at": count_record.created_at.isoformat()
+    }
+
+
+@app.get("/products/{product_id}/audit/latest")
+def get_latest_product_audit(
+    product_id: int,
+    branch_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    latest = db.query(InventoryCountDB).filter(
+        InventoryCountDB.product_id == product_id,
+        InventoryCountDB.branch_id == branch_id
+    ).order_by(
+        InventoryCountDB.created_at.desc(),
+        InventoryCountDB.id.desc()
+    ).first()
+
+    if not latest:
+        return {
+            "has_count": False,
+            "branch_id": branch_id,
+            "product_id": product_id
+        }
+
+    return {
+        "has_count": True,
+        "branch_id": latest.branch_id,
+        "product_id": latest.product_id,
+        "system_qty": latest.system_qty,
+        "counted_qty": latest.counted_qty,
+        "difference": latest.difference,
+        "reported_by": latest.reported_by,
+        "created_at": latest.created_at.isoformat()
     }
 
 

@@ -1450,8 +1450,7 @@ def delete_promotion(promotion_id: int, db: Session = Depends(get_db)):
     db.commit()
     return {"status": "success", "message": "Promoción desactivada correctamente"}
 
-@app.post("/promotions/{promotion_id}/calculate")
-def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: PromotionCalculateRequestSchema = None, db: Session = Depends(get_db)):
+def _calculate_promotion_breakdown(promotion_id: int, branch_id: int, items_input: List[ItemSchema], db: Session):
     promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
     if not promo or not promo.active:
         raise HTTPException(status_code=404, detail="Promoción no encontrada o inactiva")
@@ -1466,7 +1465,7 @@ def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: Promotio
 
     promo_price = b_conf.promo_price if b_conf else 0.0
 
-    provided_items = {item.product_id: item.actual_qty for item in (payload.items if payload else [])}
+    provided_items = {item.product_id: item.quantity for item in items_input}
     required_product_ids = {item.product_id for item in promo.items}
 
     if set(provided_items.keys()) != required_product_ids:
@@ -1474,16 +1473,17 @@ def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: Promotio
 
     breakdown = []
     total_extra = 0.0
+    sum_peso_valor = 0.0
 
+    temp_items = []
     for promo_item in promo.items:
         prod_id = promo_item.product_id
         actual_qty = provided_items.get(prod_id, 0.0)
         included_qty = promo_item.included_qty
 
-        if actual_qty < 0:
-            raise HTTPException(status_code=422, detail="La cantidad real no puede ser negativa")
+        if actual_qty <= 0:
+            raise HTTPException(status_code=422, detail="La cantidad real debe ser mayor a cero")
 
-        # Validar disponibilidad y stock en sucursal
         prod_config = db.query(BranchProductDB).filter(
             BranchProductDB.branch_id == branch_id,
             BranchProductDB.product_id == prod_id,
@@ -1492,36 +1492,88 @@ def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: Promotio
         if not prod_config:
             raise HTTPException(status_code=409, detail=f"El producto ID {prod_id} no está disponible en esta sucursal")
 
-        branch_stock = get_branch_stock(db, prod_id, branch_id)
-        if branch_stock < actual_qty:
-            raise HTTPException(status_code=409, detail=f"Stock insuficiente para el producto ID {prod_id}")
-
         regular_price = prod_config.price_per_unit if prod_config.price_per_unit is not None else promo_item.product.price_per_unit
 
         extra_qty = max(0.0, actual_qty - included_qty)
         extra_amount = round(extra_qty * regular_price, 2)
         total_extra += extra_amount
 
-        breakdown.append({
-            "product_id": prod_id,
-            "product_name": promo_item.product.name,
-            "included_qty": included_qty,
+        peso_valor = included_qty * regular_price
+        sum_peso_valor += peso_valor
+
+        temp_items.append({
+            "promo_item": promo_item,
+            "prod_config": prod_config,
             "actual_qty": actual_qty,
-            "extra_qty": round(extra_qty, 3),
-            "unit_type": promo_item.unit_type,
-            "regular_unit_price": regular_price,
-            "extra_amount": extra_amount
+            "included_qty": included_qty,
+            "extra_qty": extra_qty,
+            "extra_amount": extra_amount,
+            "regular_price": regular_price,
+            "peso_valor": peso_valor
         })
 
-    final_total = round(promo_price + total_extra, 2)
+    expected_total = round(promo_price + total_extra, 2)
+
+    assigned_base_sum = 0.0
+    processed = 0
+    calculated_items = []
+
+    for t in temp_items:
+        processed += 1
+        if sum_peso_valor > 0:
+            base_asignada = round(promo_price * (t["peso_valor"] / sum_peso_valor), 2)
+        else:
+            base_asignada = round(promo_price / len(temp_items), 2)
+
+        if processed == len(temp_items):
+            # Ajustar centavos para el último componente
+            diff_centavos = promo_price - (assigned_base_sum + base_asignada)
+            base_asignada = round(base_asignada + diff_centavos, 2)
+
+        assigned_base_sum += base_asignada
+        revenue_item = round(base_asignada + t["extra_amount"], 2)
+
+        calculated_items.append({
+            "product_id": t["promo_item"].product_id,
+            "product_name": t["promo_item"].product.name,
+            "unit_type": t["promo_item"].unit_type,
+            "actual_qty": t["actual_qty"],
+            "regular_price": t["regular_price"],
+            "extra_amount": t["extra_amount"],
+            "base_asignada": base_asignada,
+            "revenue_item": revenue_item
+        })
+
+    return expected_total, calculated_items
+
+@app.post("/promotions/{promotion_id}/calculate")
+def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: PromotionCalculateRequestSchema = None, db: Session = Depends(get_db)):
+    items_input = [ItemSchema(product_id=i.product_id, quantity=i.actual_qty) for i in (payload.items if payload else [])]
+    expected_total, calculated_items = _calculate_promotion_breakdown(promotion_id, branch_id, items_input, db)
+    
+    promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
+    b_conf = db.query(PromotionBranchDB).filter(PromotionBranchDB.promotion_id == promo.id, PromotionBranchDB.branch_id == branch_id).first()
+    promo_price = b_conf.promo_price if b_conf else 0.0
+    total_extra = round(sum(i["extra_amount"] for i in calculated_items), 2)
+
+    breakdown = []
+    for c in calculated_items:
+        breakdown.append({
+            "product_id": c["product_id"],
+            "product_name": c["product_name"],
+            "actual_qty": c["actual_qty"],
+            "unit_type": c["unit_type"],
+            "regular_unit_price": c["regular_price"],
+            "extra_amount": c["extra_amount"]
+        })
 
     return {
         "promotion_id": promo.id,
         "promotion_name": promo.name,
         "branch_id": branch_id,
         "promo_price": promo_price,
-        "total_extra": round(total_extra, 2),
-        "final_total": final_total,
+        "total_extra": total_extra,
+        "final_total": expected_total,
         "items": breakdown
     }
 
@@ -2108,6 +2160,17 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
         change_amount=payload.change_amount
     )
     db.add(sale); db.flush()
+
+    is_promo = bool(payload.is_promotion)
+    calculated_promo_items = []
+
+    if is_promo:
+        if not payload.promotion_id:
+            raise HTTPException(status_code=422, detail="promotion_id es obligatorio para ventas de promoción")
+        expected_total, calculated_promo_items = _calculate_promotion_breakdown(payload.promotion_id, branch_id, payload.items, db)
+        if abs(payload.total_amount - expected_total) > 0.05:
+            raise HTTPException(status_code=422, detail=f"El total de la venta (${payload.total_amount}) no coincide con el total esperado de la promoción (${expected_total})")
+
     products={}
     for item in payload.items:
         x=db.query(ProductDB).filter(ProductDB.id==item.product_id).first()
@@ -2117,45 +2180,68 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
             raise HTTPException(status_code=409, detail=f"Stock insuficiente o cantidad invalida: {x.name}")
         products[item.product_id]=x
 
-    # Si es una venta de promoción, podemos calcular o aceptar los precios unitarios/proporcionales.
-    # Como la estructura de items soporta cantidades reales (actual_qty), consumimos stock real con FEFO.
-    for item in payload.items:
-        x=products[item.product_id]
-        cost=consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta", db, "sale", sale.id, branch_id=branch_id)
-        
-        branch_config=db.query(BranchProductDB).filter(
-            BranchProductDB.branch_id==branch_id,
-            BranchProductDB.product_id==x.id,
-            BranchProductDB.is_available==True
-        ).first()
-        if not branch_config:
-            raise HTTPException(status_code=409, detail=f"{x.name} no esta habilitado en esta sucursal")
+    if is_promo:
+        promo_map = {ci["product_id"]: ci for ci in calculated_promo_items}
+        for item in payload.items:
+            x = products[item.product_id]
+            cost = consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta Promocion", db, "sale", sale.id, branch_id=branch_id)
+            ci = promo_map.get(item.product_id)
+            if not ci:
+                raise HTTPException(status_code=422, detail=f"El producto {x.name} no pertenece a la promoción seleccionada")
+            
+            revenue = ci["revenue_item"]
+            unit_price = round(revenue / item.quantity, 4) if item.quantity > 0 else 0.0
 
-        unit_price=branch_config.price_per_unit if branch_config.price_per_unit is not None else (x.price_per_unit or 0)
-
-        if presale:
-            psi=db.query(PreSaleItemDB).filter(
-                PreSaleItemDB.presale_id==presale.id,
-                PreSaleItemDB.product_id==x.id
+            db.add(SaleItemDB(
+                sale_id=sale.id,
+                product_id=x.id,
+                product_name=x.name,
+                quantity=item.quantity,
+                unit_type=x.unit_type,
+                unit_price=unit_price,
+                unit_cost=cost / item.quantity if item.quantity > 0 else 0.0,
+                cogs=cost,
+                gross_profit=round(revenue - cost, 2),
+                is_promotion=True,
+                promotion_id=payload.promotion_id
+            ))
+    else:
+        for item in payload.items:
+            x=products[item.product_id]
+            cost=consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta", db, "sale", sale.id, branch_id=branch_id)
+            
+            branch_config=db.query(BranchProductDB).filter(
+                BranchProductDB.branch_id==branch_id,
+                BranchProductDB.product_id==x.id,
+                BranchProductDB.is_available==True
             ).first()
-            if psi:
-                unit_price=psi.price_per_unit or unit_price
+            if not branch_config:
+                raise HTTPException(status_code=409, detail=f"{x.name} no esta habilitado en esta sucursal")
 
-        # Si se especificó una venta de promoción, podemos distribuir el precio o registrar los ítems con sus marcas de promo
-        revenue=unit_price*item.quantity
-        db.add(SaleItemDB(
-            sale_id=sale.id,
-            product_id=x.id,
-            product_name=x.name,
-            quantity=item.quantity,
-            unit_type=x.unit_type,
-            unit_price=unit_price,
-            unit_cost=cost/item.quantity if item.quantity > 0 else 0,
-            cogs=cost,
-            gross_profit=revenue-cost,
-            is_promotion=bool(payload.is_promotion),
-            promotion_id=payload.promotion_id
-        ))
+            unit_price=branch_config.price_per_unit if branch_config.price_per_unit is not None else (x.price_per_unit or 0)
+
+            if presale:
+                psi=db.query(PreSaleItemDB).filter(
+                    PreSaleItemDB.presale_id==presale.id,
+                    PreSaleItemDB.product_id==x.id
+                ).first()
+                if psi:
+                    unit_price=psi.price_per_unit or unit_price
+
+            revenue=unit_price*item.quantity
+            db.add(SaleItemDB(
+                sale_id=sale.id,
+                product_id=x.id,
+                product_name=x.name,
+                quantity=item.quantity,
+                unit_type=x.unit_type,
+                unit_price=unit_price,
+                unit_cost=cost/item.quantity if item.quantity > 0 else 0,
+                cogs=cost,
+                gross_profit=round(revenue-cost, 2),
+                is_promotion=False,
+                promotion_id=None
+            ))
 
     if presale:
         presale.status = "COMPLETADA"

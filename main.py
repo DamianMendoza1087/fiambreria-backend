@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel
@@ -207,6 +207,8 @@ class SaleDB(Base):
     amount_mp = Column(Float, default=0.0)
     payment_method = Column(String, default="Efectivo")
     sold_by = Column(String, nullable=True)
+    cash_received = Column(Float, nullable=True)
+    change_amount = Column(Float, nullable=True)
     items = relationship("SaleItemDB", back_populates="sale", cascade="all, delete-orphan")
 
 class SaleItemDB(Base):
@@ -253,7 +255,6 @@ class InventoryCountDB(Base):
 Base.metadata.create_all(bind=engine)
 
 def ensure_v2_schema():
-    # Migracion aditiva V2 para SQLite. Conserva los datos existentes.
     Base.metadata.create_all(bind=engine)
     inspector = inspect(engine)
     existing = {c["name"] for c in inspector.get_columns("products")}
@@ -281,18 +282,22 @@ def ensure_v2_schema():
 
 ensure_v2_schema()
 
-
-
 def ensure_multilocal_schema():
     Base.metadata.create_all(bind=engine)
+    inspector = inspect(engine)
 
-    user_cols = {c["name"] for c in inspect(engine).get_columns("users")}
-
+    user_cols = {c["name"] for c in inspector.get_columns("users")}
     with engine.begin() as conn:
         if "branch_id" not in user_cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN branch_id INTEGER DEFAULT 1"))
-
         conn.execute(text("UPDATE users SET branch_id=1 WHERE branch_id IS NULL"))
+
+    sale_cols = {c["name"] for c in inspector.get_columns("sales")}
+    with engine.begin() as conn:
+        if "cash_received" not in sale_cols:
+            conn.execute(text("ALTER TABLE sales ADD COLUMN cash_received FLOAT"))
+        if "change_amount" not in sale_cols:
+            conn.execute(text("ALTER TABLE sales ADD COLUMN change_amount FLOAT"))
 
     tables = [
         "product_lots",
@@ -340,9 +345,7 @@ def ensure_multilocal_schema():
                 "(2,'Feria Damyale','FERIA',1)"
             ))
 
-
 ensure_multilocal_schema()
-
 
 app = FastAPI(title="Fiambrería POS, RRHH, MRP, KPIs & Permisos API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -363,6 +366,11 @@ def utc_to_ar(value):
     if not value: return None
     aware=value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None else value
     return aware.astimezone(ARG_TZ)
+
+def ar_to_utc(dt_obj: datetime.datetime) -> datetime.datetime:
+    if dt_obj.tzinfo is None:
+        dt_obj = dt_obj.replace(tzinfo=ARG_TZ)
+    return dt_obj.astimezone(datetime.timezone.utc).replace(tzinfo=None)
 
 def parse_date_to_iso(date_str: Optional[str]) -> Optional[str]:
     if date_str is None or not str(date_str).strip():
@@ -437,6 +445,8 @@ class FinalizeSaleSchema(BaseModel):
     amount_mp: float
     payment_method: str
     sold_by: Optional[str] = "Anonimo"
+    cash_received: Optional[float] = None
+    change_amount: Optional[float] = None
 
 class ProductCreateSchema(BaseModel):
     name: str
@@ -471,7 +481,6 @@ class BranchProductConfigSchema(BaseModel):
     price_per_unit: Optional[float] = None
     is_available: bool = True
     is_exclusive: bool = False
-
 
 class IngressCreateSchema(BaseModel):
     product_id: int
@@ -546,7 +555,6 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     if not user or user.hashed_password != form_data.password:
         raise HTTPException(status_code=400, detail="Credenciales incorrectas")
 
-    # Cuenta maestra protegida del sistema
     if user.email.lower() == "admin@fiambreria.com":
         changed = False
         if user.role != "masteradmin":
@@ -606,7 +614,6 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
     u=db.query(UserDB).filter(UserDB.id==user_id).first()
     if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
 
-    # Admin Maestro: cuenta reservada e indegradable
     if u.email.lower() == "admin@fiambreria.com":
         if p.role is not None and p.role != "masteradmin":
             raise HTTPException(status_code=403, detail="El Admin Maestro no puede ser degradado")
@@ -823,8 +830,6 @@ def branch_product_view(product: ProductDB, branch_id: int, db: Session):
         BranchProductDB.product_id == product.id
     ).first()
 
-    # Compatibilidad histórica: todos los productos existentes pertenecen
-    # inicialmente a Fiambrería Local.
     if branch_id == 1 and not config:
         config = BranchProductDB(
             branch_id=1,
@@ -850,7 +855,6 @@ def branch_product_view(product: ProductDB, branch_id: int, db: Session):
     data["is_exclusive"] = bool(config.is_exclusive)
     return data
 
-
 @app.get("/products")
 def get_products(branch_id: int = 1, db: Session = Depends(get_db)):
     products = db.query(ProductDB).filter(ProductDB.is_active == True).order_by(ProductDB.name.asc()).all()
@@ -861,7 +865,6 @@ def get_products(branch_id: int = 1, db: Session = Depends(get_db)):
             result.append(view)
     db.commit()
     return result
-
 
 @app.get("/products/master/by-barcode/{barcode}")
 def get_master_product_by_barcode(
@@ -886,7 +889,6 @@ def get_master_product_by_barcode(
         for c in ProductDB.__table__.columns
     }
 
-
 @app.get("/products/by-barcode/{barcode}")
 def get_product_by_barcode(barcode: str, branch_id: int = 1, db: Session = Depends(get_db)):
     product = db.query(ProductDB).filter(ProductDB.barcode == barcode.strip()).first()
@@ -899,7 +901,6 @@ def get_product_by_barcode(barcode: str, branch_id: int = 1, db: Session = Depen
 
     db.commit()
     return view
-
 
 @app.get("/products/search")
 def search_products(q: str = "", branch_id: int = 1, db: Session = Depends(get_db)):
@@ -964,7 +965,6 @@ def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
             BranchProductDB.product_id == product.id
         ).first()
 
-        # La sucursal principal conserva compatibilidad con catálogo histórico.
         if branch_id == 1 and not config:
             config = BranchProductDB(
                 branch_id=1,
@@ -997,7 +997,6 @@ def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
 
     db.commit()
     return result
-
 
 @app.put("/branches/{branch_id}/products/{product_id}")
 def configure_branch_product(
@@ -1056,7 +1055,6 @@ def configure_branch_product(
         "stock": get_branch_stock(db, product_id, branch_id)
     }
 
-
 @app.delete("/branches/{branch_id}/products/{product_id}")
 def remove_product_from_branch(
     branch_id: int,
@@ -1074,9 +1072,7 @@ def remove_product_from_branch(
             detail="Producto no configurado en esta sucursal"
         )
 
-    # No se elimina el producto maestro ni su historial.
     config.is_available = False
-
     db.commit()
 
     return {
@@ -1085,7 +1081,6 @@ def remove_product_from_branch(
         "product_id": product_id,
         "is_available": False
     }
-
 
 @app.post("/products/master")
 def create_product_master(
@@ -1147,9 +1142,6 @@ def create_product_master(
 
     db.add(config)
 
-    # Un producto creado desde Feria nace exclusivo de Feria.
-    # Dejamos una configuración explícita deshabilitada en Fiambrería
-    # para impedir que la compatibilidad histórica lo habilite sola.
     if branch_id != 1:
         main_config = db.query(BranchProductDB).filter(
             BranchProductDB.branch_id == 1,
@@ -1341,7 +1333,6 @@ def audit_product_stock(
     if audit.counted_qty < 0:
         raise HTTPException(status_code=422, detail="Conteo negativo")
 
-    # El stock real se calcula exclusivamente con los lotes de esta sucursal.
     old = get_branch_stock(db, product_id, branch_id)
     diff = audit.counted_qty - old
 
@@ -1385,7 +1376,6 @@ def audit_product_stock(
             branch_id=branch_id
         )
 
-    # Crear siempre un registro InventoryCountDB, incluso si difference == 0
     count_record = InventoryCountDB(
         branch_id=branch_id,
         product_id=x.id,
@@ -1424,7 +1414,6 @@ def audit_product_stock(
         "counted_at": count_record.created_at.isoformat()
     }
 
-
 @app.get("/products/{product_id}/audit/latest")
 def get_latest_product_audit(
     product_id: int,
@@ -1456,7 +1445,6 @@ def get_latest_product_audit(
         "reported_by": latest.reported_by,
         "created_at": latest.created_at.isoformat()
     }
-
 
 @app.delete("/products/{product_id}")
 def delete_product(product_id:int,db:Session=Depends(get_db)):
@@ -1503,7 +1491,6 @@ def create_presale(payload: PreSaleCreateSchema, branch_id: int = 1, db: Session
     presale.total_amount = total
     db.commit()
     return {"status": "success", "presale_id": presale.id, "total": total}
-
 
 @app.get("/presales/pending")
 def get_pending_presales(branch_id: int = 1, db: Session = Depends(get_db)):
@@ -1566,14 +1553,12 @@ def consume_stock_fefo(product: ProductDB, quantity: float, movement_type: str, 
     product.stock=(product.stock or 0)-quantity
     return total_cost
 
-
 def get_branch_stock(db: Session, product_id: int, branch_id: int = 1) -> float:
     value = db.query(func.coalesce(func.sum(ProductLotDB.current_qty), 0.0)).filter(
         ProductLotDB.product_id == product_id,
         ProductLotDB.branch_id == branch_id
     ).scalar()
     return float(value or 0.0)
-
 
 @app.get("/cash/status")
 def get_cash_status(branch_id: int = 1, db: Session = Depends(get_db)):
@@ -1606,6 +1591,33 @@ def open_cash(payload: CashOpenSchema, branch_id: int = 1, db: Session = Depends
     db.refresh(session)
     return {"status": "ok", "session_id": session.id}
 
+def serialize_sale_ticket(sale: SaleDB):
+    return {
+        "id": sale.id,
+        "branch_id": sale.branch_id,
+        "presale_id": sale.presale_id,
+        "session_id": sale.session_id,
+        "created_at": utc_to_ar(sale.created_at).isoformat() if sale.created_at else None,
+        "total_amount": sale.total_amount,
+        "amount_cash": sale.amount_cash,
+        "amount_mp": sale.amount_mp,
+        "payment_method": sale.payment_method,
+        "cash_received": sale.cash_received,
+        "change_amount": sale.change_amount,
+        "sold_by": sale.sold_by,
+        "items": [
+            {
+                "id": item.id,
+                "product_id": item.product_id,
+                "product_name": item.product_name,
+                "quantity": item.quantity,
+                "unit_price": item.unit_price,
+                "subtotal": round(item.quantity * item.unit_price, 2)
+            }
+            for item in sale.items
+        ]
+    }
+
 @app.post("/sales/finalize")
 def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session = Depends(get_db)):
     active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True,CashSessionDB.branch_id==branch_id).first()
@@ -1624,7 +1636,18 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
                 detail="La preventa no pertenece a esta sucursal o ya fue procesada"
             )
 
-    sale=SaleDB(branch_id=branch_id,presale_id=payload.presale_id, session_id=active.id if active else None, total_amount=payload.total_amount, amount_cash=payload.amount_cash, amount_mp=payload.amount_mp, payment_method=payload.payment_method, sold_by=payload.sold_by)
+    sale=SaleDB(
+        branch_id=branch_id,
+        presale_id=payload.presale_id,
+        session_id=active.id if active else None,
+        total_amount=payload.total_amount,
+        amount_cash=payload.amount_cash,
+        amount_mp=payload.amount_mp,
+        payment_method=payload.payment_method,
+        sold_by=payload.sold_by,
+        cash_received=payload.cash_received,
+        change_amount=payload.change_amount
+    )
     db.add(sale); db.flush()
     products={}
     for item in payload.items:
@@ -1655,11 +1678,115 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
             if psi:
                 unit_price=psi.price_per_unit or unit_price
         revenue=unit_price*item.quantity
-        db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_price=unit_price, unit_cost=cost/item.quantity, cogs=cost, gross_profit=revenue-cost))
+        db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_price=unit_price, unit_cost=cost/item.quantity if item.quantity > 0 else 0, cogs=cost, gross_profit=revenue-cost))
     if presale:
         presale.status = "COMPLETADA"
     db.commit()
-    return {"status":"success","message":"Venta procesada","sale_id":sale.id}
+    db.refresh(sale)
+    return {
+        "status": "success",
+        "sale_id": sale.id,
+        "branch_id": sale.branch_id,
+        "created_at": utc_to_ar(sale.created_at).isoformat() if sale.created_at else None,
+        "total_amount": sale.total_amount,
+        "amount_cash": sale.amount_cash,
+        "amount_mp": sale.amount_mp,
+        "payment_method": sale.payment_method,
+        "cash_received": sale.cash_received,
+        "change_amount": sale.change_amount,
+        "sold_by": sale.sold_by
+    }
+
+@app.get("/sales/history")
+def get_sales_history(
+    branch_id: int = 1,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    safe_limit = min(max(limit, 1), 500)
+    query = db.query(SaleDB).filter(SaleDB.branch_id == branch_id)
+
+    if date_from:
+        try:
+            dt_from_local = datetime.datetime.strptime(date_from.strip(), "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+            dt_from_utc = ar_to_utc(dt_from_local)
+            query = query.filter(SaleDB.created_at >= dt_from_utc)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Formato de date_from invalido. Usa YYYY-MM-DD.")
+
+    if date_to:
+        try:
+            dt_to_local_day = datetime.datetime.strptime(date_to.strip(), "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+            next_day_local = dt_to_local_day + datetime.timedelta(days=1)
+            next_day_utc = ar_to_utc(next_day_local)
+            query = query.filter(SaleDB.created_at < next_day_utc)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Formato de date_to invalido. Usa YYYY-MM-DD.")
+
+    if search and search.strip():
+        term = search.strip()
+        subq = db.query(SaleItemDB.sale_id).filter(SaleItemDB.product_name.ilike(f"%{term}%")).subquery()
+        if term.isdigit():
+            sale_id_val = int(term)
+            query = query.filter(
+                or_(
+                    SaleDB.id == sale_id_val,
+                    SaleDB.sold_by.ilike(f"%{term}%"),
+                    SaleDB.id.in_(subq)
+                )
+            )
+        else:
+            query = query.filter(
+                or_(
+                    SaleDB.sold_by.ilike(f"%{term}%"),
+                    SaleDB.id.in_(subq)
+                )
+            )
+
+    sales = query.order_by(SaleDB.created_at.desc(), SaleDB.id.desc()).limit(safe_limit).all()
+
+    if not sales:
+        return []
+
+    sale_ids = [s.id for s in sales]
+    item_counts_raw = db.query(SaleItemDB.sale_id, func.count(SaleItemDB.id)).filter(SaleItemDB.sale_id.in_(sale_ids)).group_by(SaleItemDB.sale_id).all()
+    counts_map = {row[0]: row[1] for row in item_counts_raw}
+
+    result = []
+    for s in sales:
+        result.append({
+            "id": s.id,
+            "branch_id": s.branch_id,
+            "created_at": utc_to_ar(s.created_at).isoformat() if s.created_at else None,
+            "total_amount": s.total_amount,
+            "payment_method": s.payment_method,
+            "amount_cash": s.amount_cash,
+            "amount_mp": s.amount_mp,
+            "cash_received": s.cash_received,
+            "change_amount": s.change_amount,
+            "sold_by": s.sold_by,
+            "items_count": counts_map.get(s.id, 0)
+        })
+    return result
+
+@app.get("/sales/{sale_id}")
+def get_sale_detail(
+    sale_id: int,
+    branch_id: int = 1,
+    db: Session = Depends(get_db)
+):
+    sale = db.query(SaleDB).filter(
+        SaleDB.id == sale_id,
+        SaleDB.branch_id == branch_id
+    ).first()
+
+    if not sale:
+        raise HTTPException(status_code=404, detail="Venta no encontrada en esta sucursal")
+
+    return serialize_sale_ticket(sale)
 
 @app.post("/cash/movements")
 def create_cash_movement(payload: CashMovementCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):

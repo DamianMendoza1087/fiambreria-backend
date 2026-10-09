@@ -31,6 +31,7 @@ class UserDB(Base):
     can_mrp = Column(Boolean, default=False)
     can_verificacion = Column(Boolean, default=False)
     can_kpis = Column(Boolean, default=False)
+    can_carteleria = Column(Boolean, default=False)
     can_edit_records = Column(Boolean, default=False)  # Controla si el dueño/usuario puede editar/eliminar registros
     branch_id = Column(Integer, default=1, index=True)  # Sucursal de trabajo predeterminada
 
@@ -48,6 +49,7 @@ class BranchProductDB(Base):
     branch_id = Column(Integer, ForeignKey("branches.id"), nullable=False, index=True)
     product_id = Column(Integer, ForeignKey("products.id"), nullable=False, index=True)
     price_per_unit = Column(Float, nullable=True)
+    minimum_stock = Column(Float, nullable=True)
     is_available = Column(Boolean, default=True)
     is_exclusive = Column(Boolean, default=False)
 
@@ -112,7 +114,7 @@ class PromotionBranchDB(Base):
     id = Column(Integer, primary_key=True, index=True)
     promotion_id = Column(Integer, ForeignKey("promotions.id"), nullable=False)
     branch_id = Column(Integer, ForeignKey("branches.id"), nullable=False)
-    promo_price = Column(Float, nullable=False)
+    promo_price = Column(Float, nullable=True)
     enabled = Column(Boolean, default=True)
     promotion = relationship("PromotionDB", back_populates="branch_configs")
 
@@ -335,7 +337,14 @@ def ensure_multilocal_schema():
     with engine.begin() as conn:
         if "branch_id" not in user_cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN branch_id INTEGER DEFAULT 1"))
+        if "can_carteleria" not in user_cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN can_carteleria BOOLEAN DEFAULT 0"))
         conn.execute(text("UPDATE users SET branch_id=1 WHERE branch_id IS NULL"))
+
+    bp_cols = {c["name"] for c in inspector.get_columns("branch_products")}
+    with engine.begin() as conn:
+        if "minimum_stock" not in bp_cols:
+            conn.execute(text("ALTER TABLE branch_products ADD COLUMN minimum_stock FLOAT"))
 
     sale_cols = {c["name"] for c in inspector.get_columns("sales")}
     with engine.begin() as conn:
@@ -453,7 +462,7 @@ def init_db():
             is_active=True,
             can_preventa=True, can_caja=True, can_stock=True, can_ingreso=True,
             can_alertas=True, can_rrhh=True, can_mrp=True, can_verificacion=True,
-            can_kpis=True, can_edit_records=True
+            can_kpis=True, can_carteleria=True, can_edit_records=True
         ))
         db.commit()
     db.close()
@@ -476,6 +485,7 @@ class PermissionsSchema(BaseModel):
     can_mrp: Optional[bool] = None
     can_verificacion: Optional[bool] = None
     can_kpis: Optional[bool] = None
+    can_carteleria: Optional[bool] = None
     can_edit_records: Optional[bool] = None
     branch_id: Optional[int] = None
 
@@ -535,6 +545,7 @@ class ProductMasterSchema(BaseModel):
 
 class BranchProductConfigSchema(BaseModel):
     price_per_unit: Optional[float] = None
+    minimum_stock: Optional[float] = None
     is_available: bool = True
     is_exclusive: bool = False
 
@@ -546,7 +557,7 @@ class PromotionItemInputSchema(BaseModel):
 
 class PromotionBranchConfigSchema(BaseModel):
     branch_id: int
-    promo_price: float
+    promo_price: Optional[float] = None
     enabled: bool = True
 
 class PromotionCreateSchema(BaseModel):
@@ -655,6 +666,9 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         if not user.can_edit_records:
             user.can_edit_records = True
             changed = True
+        if not user.can_carteleria:
+            user.can_carteleria = True
+            changed = True
         if changed:
             db.commit()
             db.refresh(user)
@@ -673,6 +687,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         "can_mrp": user.can_mrp,
         "can_verificacion": user.can_verificacion,
         "can_kpis": user.can_kpis,
+        "can_carteleria": user.can_carteleria,
         "can_edit_records": user.can_edit_records,
         "branch_id": user.branch_id or 1
     }
@@ -692,6 +707,7 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
         is_active=False,
         can_preventa=True, can_caja=False, can_stock=False, can_ingreso=False,
         can_alertas=False, can_rrhh=False, can_mrp=False, can_verificacion=False, can_kpis=False,
+        can_carteleria=bool(user_data.get("can_carteleria", role in ["superadmin", "dueno"])),
         can_edit_records=(role in ["superadmin", "dueno"]),
         branch_id=int(user_data.get("branch_id", 1) or 1)
     )
@@ -711,12 +727,15 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
         u.role = "masteradmin"
         u.is_active = True
         u.can_edit_records = True
+        u.can_carteleria = True
 
     if p.role is not None and u.email.lower() != "admin@fiambreria.com":
         if p.role not in ("superadmin", "dueno", "vendedor"):
             raise HTTPException(status_code=400, detail="Rol invalido")
         u.role=p.role
-        if p.role=="superadmin": u.can_edit_records=True
+        if p.role=="superadmin":
+            u.can_edit_records=True
+            u.can_carteleria=True
     if p.is_active is not None: u.is_active=p.is_active
     if p.can_preventa is not None: u.can_preventa=p.can_preventa
     if p.can_caja is not None: u.can_caja=p.can_caja
@@ -727,6 +746,7 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
     if p.can_mrp is not None: u.can_mrp=p.can_mrp
     if p.can_verificacion is not None: u.can_verificacion=p.can_verificacion
     if p.can_kpis is not None: u.can_kpis=p.can_kpis
+    if p.can_carteleria is not None: u.can_carteleria=p.can_carteleria
     if p.can_edit_records is not None: u.can_edit_records=p.can_edit_records
     if p.branch_id is not None:
         if p.branch_id not in (1, 2):
@@ -924,6 +944,7 @@ def branch_product_view(product: ProductDB, branch_id: int, db: Session):
             branch_id=1,
             product_id=product.id,
             price_per_unit=product.price_per_unit,
+            minimum_stock=None,
             is_available=product.is_active,
             is_exclusive=False
         )
@@ -940,6 +961,7 @@ def branch_product_view(product: ProductDB, branch_id: int, db: Session):
         if config.price_per_unit is not None
         else product.price_per_unit
     )
+    data["minimum_stock"] = config.minimum_stock
     data["branch_id"] = branch_id
     data["is_exclusive"] = bool(config.is_exclusive)
     return data
@@ -1059,6 +1081,7 @@ def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
                 branch_id=1,
                 product_id=product.id,
                 price_per_unit=product.price_per_unit,
+                minimum_stock=None,
                 is_available=True,
                 is_exclusive=False
             )
@@ -1080,6 +1103,7 @@ def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
                 if config and config.price_per_unit is not None
                 else product.price_per_unit
             ),
+            "minimum_stock": config.minimum_stock if config else None,
             "stock": get_branch_stock(db, product.id, branch_id),
             "is_available": bool(config.is_available) if config else False,
             "is_exclusive": bool(config.is_exclusive) if config else False,
@@ -1112,6 +1136,8 @@ def configure_branch_product(
 
     if payload.price_per_unit is not None and payload.price_per_unit < 0:
         raise HTTPException(status_code=422, detail="El precio no puede ser negativo")
+    if payload.minimum_stock is not None and payload.minimum_stock < 0:
+        raise HTTPException(status_code=422, detail="El stock mínimo no puede ser negativo")
 
     config = db.query(BranchProductDB).filter(
         BranchProductDB.branch_id == branch_id,
@@ -1130,6 +1156,8 @@ def configure_branch_product(
         if payload.price_per_unit is not None
         else product.price_per_unit
     )
+    if payload.minimum_stock is not None:
+        config.minimum_stock = payload.minimum_stock
     config.is_available = payload.is_available
     config.is_exclusive = payload.is_exclusive
 
@@ -1141,6 +1169,7 @@ def configure_branch_product(
         "branch_id": branch_id,
         "product_id": product_id,
         "price_per_unit": config.price_per_unit,
+        "minimum_stock": config.minimum_stock,
         "is_available": config.is_available,
         "is_exclusive": config.is_exclusive,
         "stock": get_branch_stock(db, product_id, branch_id)
@@ -1229,6 +1258,7 @@ def create_product_master(
         branch_id=branch_id,
         product_id=x.id,
         price_per_unit=prod.price_per_unit,
+        minimum_stock=None,
         is_available=True,
         is_exclusive=(branch_id != 1)
     )
@@ -1246,6 +1276,7 @@ def create_product_master(
                 branch_id=1,
                 product_id=x.id,
                 price_per_unit=prod.price_per_unit,
+                minimum_stock=None,
                 is_available=False,
                 is_exclusive=False
             ))
@@ -1279,7 +1310,6 @@ def get_promotions(branch_id: int = 1, db: Session = Depends(get_db)):
         items_list = []
         for item in promo.items:
             prod = item.product
-            # Obtener el precio normal vigente en la sucursal para este producto
             prod_config = db.query(BranchProductDB).filter(
                 BranchProductDB.branch_id == branch_id,
                 BranchProductDB.product_id == prod.id
@@ -1347,8 +1377,26 @@ def get_promotion_detail(promotion_id: int, branch_id: int = 1, db: Session = De
         "items": items_list
     }
 
+def _validate_promotion_branches(branch_configs: List[PromotionBranchConfigSchema]):
+    any_enabled = False
+    for b_conf in branch_configs:
+        if b_conf.enabled:
+            any_enabled = True
+            if b_conf.promo_price is None or b_conf.promo_price <= 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="La sucursal habilitada debe tener un precio promocional mayor a 0."
+                )
+    if not any_enabled:
+        raise HTTPException(
+            status_code=422,
+            detail="La promoción debe estar habilitada al menos en una sucursal."
+        )
+
 @app.post("/promotions")
 def create_promotion(payload: PromotionCreateSchema, db: Session = Depends(get_db)):
+    _validate_promotion_branches(payload.branch_configs)
+
     promo = PromotionDB(
         name=payload.name.strip(),
         description=payload.description,
@@ -1378,13 +1426,11 @@ def create_promotion(payload: PromotionCreateSchema, db: Session = Depends(get_d
         branch = db.query(BranchDB).filter(BranchDB.id == b_conf.branch_id).first()
         if not branch:
             raise HTTPException(status_code=404, detail=f"Sucursal {b_conf.branch_id} no encontrada")
-        if b_conf.promo_price < 0:
-            raise HTTPException(status_code=422, detail="El precio de promoción no puede ser negativo")
         
         pb = PromotionBranchDB(
             promotion_id=promo.id,
             branch_id=b_conf.branch_id,
-            promo_price=b_conf.promo_price,
+            promo_price=b_conf.promo_price if b_conf.enabled else (b_conf.promo_price if b_conf.promo_price is not None else 0.0),
             enabled=b_conf.enabled
         )
         db.add(pb)
@@ -1398,6 +1444,9 @@ def update_promotion(promotion_id: int, payload: PromotionUpdateSchema, db: Sess
     promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
     if not promo:
         raise HTTPException(status_code=404, detail="Promoción no encontrada")
+
+    if payload.branch_configs is not None:
+        _validate_promotion_branches(payload.branch_configs)
 
     if payload.name is not None:
         promo.name = payload.name.strip()
@@ -1430,7 +1479,7 @@ def update_promotion(promotion_id: int, payload: PromotionUpdateSchema, db: Sess
             pb = PromotionBranchDB(
                 promotion_id=promo.id,
                 branch_id=b_conf.branch_id,
-                promo_price=b_conf.promo_price,
+                promo_price=b_conf.promo_price if b_conf.enabled else (b_conf.promo_price if b_conf.promo_price is not None else 0.0),
                 enabled=b_conf.enabled
             )
             db.add(pb)
@@ -1445,7 +1494,6 @@ def delete_promotion(promotion_id: int, db: Session = Depends(get_db)):
     if not promo:
         raise HTTPException(status_code=404, detail="Promoción no encontrada")
     
-    # Desactivación lógica o eliminación limpia
     promo.active = False
     db.commit()
     return {"status": "success", "message": "Promoción desactivada correctamente"}
@@ -1463,7 +1511,7 @@ def _calculate_promotion_breakdown(promotion_id: int, branch_id: int, items_inpu
     if b_conf and not b_conf.enabled:
         raise HTTPException(status_code=400, detail="La promoción no está habilitada en esta sucursal")
 
-    promo_price = b_conf.promo_price if b_conf else 0.0
+    promo_price = b_conf.promo_price if (b_conf and b_conf.promo_price is not None) else 0.0
 
     provided_items = {item.product_id: item.quantity for item in items_input}
     required_product_ids = {item.product_id for item in promo.items}
@@ -1526,7 +1574,6 @@ def _calculate_promotion_breakdown(promotion_id: int, branch_id: int, items_inpu
             base_asignada = round(promo_price / len(temp_items), 2)
 
         if processed == len(temp_items):
-            # Ajustar centavos para el último componente
             diff_centavos = promo_price - (assigned_base_sum + base_asignada)
             base_asignada = round(base_asignada + diff_centavos, 2)
 
@@ -1553,7 +1600,7 @@ def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: Promotio
     
     promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
     b_conf = db.query(PromotionBranchDB).filter(PromotionBranchDB.promotion_id == promo.id, PromotionBranchDB.branch_id == branch_id).first()
-    promo_price = b_conf.promo_price if b_conf else 0.0
+    promo_price = b_conf.promo_price if (b_conf and b_conf.promo_price is not None) else 0.0
     total_extra = round(sum(i["extra_amount"] for i in calculated_items), 2)
 
     breakdown = []
@@ -1604,6 +1651,7 @@ def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session
             branch_id=branch_id,
             product_id=product.id,
             price_per_unit=product.price_per_unit,
+            minimum_stock=None,
             is_available=True,
             is_exclusive=False
         )
@@ -1622,7 +1670,6 @@ def get_ingresses(product_id: Optional[int]=None, branch_id: int = 1, db: Sessio
     if product_id is not None: q=q.filter(ProductIngressDB.product_id==product_id)
     return q.order_by(ProductIngressDB.id.desc()).limit(200).all()
 
-# NUEVO: Historial / buscador avanzado de ingresos
 @app.get("/ingresses/history")
 def get_ingresses_history(
     branch_id: int = 1,
@@ -2643,12 +2690,13 @@ def get_system_alerts(branch_id: int = 1, db: Session = Depends(get_db)):
 
         branch_stock=get_branch_stock(db,product.id,branch_id)
         policy=(product.replenishment_policy or "MRP").upper()
+        min_stock = config.minimum_stock
 
         if policy=="MRP":
             if branch_stock<=0:
                 append_alert(alerts,f"stock-b{branch_id}-{product.id}-zero","STOCK","CRITICAL",f"Producto agotado: {product.name}",f"Stock 0 {product.unit_type}.",db,product.id)
-            elif branch_stock<=5:
-                append_alert(alerts,f"stock-b{branch_id}-{product.id}-low-{round(branch_stock,3)}","STOCK","IMPORTANT",f"Stock bajo: {product.name}",f"Quedan {branch_stock} {product.unit_type}.",db,product.id)
+            elif min_stock is not None and min_stock > 0 and branch_stock <= min_stock:
+                append_alert(alerts,f"stock-b{branch_id}-{product.id}-low","STOCK","IMPORTANT",f"Stock bajo: {product.name}",f"Quedan {branch_stock} {product.unit_type}. Mínimo configurado: {min_stock} {product.unit_type}.",db,product.id)
 
         branch_price=config.price_per_unit if config.price_per_unit is not None else product.price_per_unit
         if (product.cost_price or 0)>0 and branch_price<=product.cost_price:

@@ -222,6 +222,7 @@ class SaleItemDB(Base):
     unit_cost = Column(Float, default=0.0)
     cogs = Column(Float, default=0.0)
     gross_profit = Column(Float, default=0.0)
+    unit_type = Column(String, nullable=True)
     sale = relationship("SaleDB", back_populates="items")
 
 class CashSessionDB(Base):
@@ -298,6 +299,11 @@ def ensure_multilocal_schema():
             conn.execute(text("ALTER TABLE sales ADD COLUMN cash_received FLOAT"))
         if "change_amount" not in sale_cols:
             conn.execute(text("ALTER TABLE sales ADD COLUMN change_amount FLOAT"))
+
+    sale_item_cols = {c["name"] for c in inspector.get_columns("sale_items")}
+    with engine.begin() as conn:
+        if "unit_type" not in sale_item_cols:
+            conn.execute(text("ALTER TABLE sale_items ADD COLUMN unit_type VARCHAR"))
 
     tables = [
         "product_lots",
@@ -1592,31 +1598,41 @@ def open_cash(payload: CashOpenSchema, branch_id: int = 1, db: Session = Depends
     return {"status": "ok", "session_id": session.id}
 
 def serialize_sale_ticket(sale: SaleDB):
-    return {
-        "id": sale.id,
-        "branch_id": sale.branch_id,
-        "presale_id": sale.presale_id,
-        "session_id": sale.session_id,
-        "created_at": utc_to_ar(sale.created_at).isoformat() if sale.created_at else None,
-        "total_amount": sale.total_amount,
-        "amount_cash": sale.amount_cash,
-        "amount_mp": sale.amount_mp,
-        "payment_method": sale.payment_method,
-        "cash_received": sale.cash_received,
-        "change_amount": sale.change_amount,
-        "sold_by": sale.sold_by,
-        "items": [
-            {
+    db = SessionLocal()
+    try:
+        items_res = []
+        for item in sale.items:
+            u_type = item.unit_type
+            if not u_type and item.product_id:
+                prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
+                if prod:
+                    u_type = prod.unit_type
+            items_res.append({
                 "id": item.id,
                 "product_id": item.product_id,
                 "product_name": item.product_name,
                 "quantity": item.quantity,
+                "unit_type": u_type,
                 "unit_price": item.unit_price,
                 "subtotal": round(item.quantity * item.unit_price, 2)
-            }
-            for item in sale.items
-        ]
-    }
+            })
+        return {
+            "id": sale.id,
+            "branch_id": sale.branch_id,
+            "presale_id": sale.presale_id,
+            "session_id": sale.session_id,
+            "created_at": utc_to_ar(sale.created_at).isoformat() if sale.created_at else None,
+            "total_amount": sale.total_amount,
+            "amount_cash": sale.amount_cash,
+            "amount_mp": sale.amount_mp,
+            "payment_method": sale.payment_method,
+            "cash_received": sale.cash_received,
+            "change_amount": sale.change_amount,
+            "sold_by": sale.sold_by,
+            "items": items_res
+        }
+    finally:
+        db.close()
 
 @app.post("/sales/finalize")
 def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session = Depends(get_db)):
@@ -1678,7 +1694,7 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
             if psi:
                 unit_price=psi.price_per_unit or unit_price
         revenue=unit_price*item.quantity
-        db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_price=unit_price, unit_cost=cost/item.quantity if item.quantity > 0 else 0, cogs=cost, gross_profit=revenue-cost))
+        db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_type=x.unit_type, unit_price=unit_price, unit_cost=cost/item.quantity if item.quantity > 0 else 0, cogs=cost, gross_profit=revenue-cost))
     if presale:
         presale.status = "COMPLETADA"
     db.commit()

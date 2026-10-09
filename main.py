@@ -81,7 +81,40 @@ class ProductDB(Base):
     brand = Column(String, nullable=True)
     requires_expiration = Column(Boolean, default=False)
     replenishment_policy = Column(String, default="MRP")
+    visual_presentation = Column(String, nullable=True)
+    product_image_uri = Column(String, nullable=True)
     lots = relationship("ProductLotDB", back_populates="product", cascade="all, delete-orphan")
+
+class PromotionDB(Base):
+    __tablename__ = "promotions"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    description = Column(String, nullable=True)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    created_by = Column(String, nullable=True)
+    items = relationship("PromotionItemDB", back_populates="promotion", cascade="all, delete-orphan")
+    branch_configs = relationship("PromotionBranchDB", back_populates="promotion", cascade="all, delete-orphan")
+
+class PromotionItemDB(Base):
+    __tablename__ = "promotion_items"
+    id = Column(Integer, primary_key=True, index=True)
+    promotion_id = Column(Integer, ForeignKey("promotions.id"), nullable=False)
+    product_id = Column(Integer, ForeignKey("products.id"), nullable=False)
+    included_qty = Column(Float, nullable=False)
+    unit_type = Column(String, default="unid")
+    sort_order = Column(Integer, default=0)
+    promotion = relationship("PromotionDB", back_populates="items")
+    product = relationship("ProductDB")
+
+class PromotionBranchDB(Base):
+    __tablename__ = "promotion_branches"
+    id = Column(Integer, primary_key=True, index=True)
+    promotion_id = Column(Integer, ForeignKey("promotions.id"), nullable=False)
+    branch_id = Column(Integer, ForeignKey("branches.id"), nullable=False)
+    promo_price = Column(Float, nullable=False)
+    enabled = Column(Boolean, default=True)
+    promotion = relationship("PromotionDB", back_populates="branch_configs")
 
 class ProductLotDB(Base):
     __tablename__ = "product_lots"
@@ -223,6 +256,8 @@ class SaleItemDB(Base):
     cogs = Column(Float, default=0.0)
     gross_profit = Column(Float, default=0.0)
     unit_type = Column(String, nullable=True)
+    is_promotion = Column(Boolean, default=False)
+    promotion_id = Column(Integer, nullable=True)
     sale = relationship("SaleDB", back_populates="items")
 
 class CashSessionDB(Base):
@@ -263,6 +298,8 @@ def ensure_v2_schema():
         "requires_expiration": "BOOLEAN DEFAULT 0",
         "replenishment_policy": "VARCHAR DEFAULT 'MRP'",
         "brand": "VARCHAR",
+        "visual_presentation": "VARCHAR",
+        "product_image_uri": "VARCHAR"
     }
     with engine.begin() as conn:
         for column_name, ddl in additions.items():
@@ -275,7 +312,14 @@ def ensure_v2_schema():
             conn.execute(text("ALTER TABLE work_logs ADD COLUMN role_worked VARCHAR"))
 
     sale_cols={c["name"] for c in inspector.get_columns("sale_items")}
-    sale_additions={"unit_price":"FLOAT DEFAULT 0","unit_cost":"FLOAT DEFAULT 0","cogs":"FLOAT DEFAULT 0","gross_profit":"FLOAT DEFAULT 0"}
+    sale_additions={
+        "unit_price": "FLOAT DEFAULT 0",
+        "unit_cost": "FLOAT DEFAULT 0",
+        "cogs": "FLOAT DEFAULT 0",
+        "gross_profit": "FLOAT DEFAULT 0",
+        "is_promotion": "BOOLEAN DEFAULT 0",
+        "promotion_id": "INTEGER"
+    }
     with engine.begin() as conn:
         for column_name, ddl in sale_additions.items():
             if column_name not in sale_cols:
@@ -453,6 +497,8 @@ class FinalizeSaleSchema(BaseModel):
     sold_by: Optional[str] = "Anonimo"
     cash_received: Optional[float] = None
     change_amount: Optional[float] = None
+    is_promotion: Optional[bool] = False
+    promotion_id: Optional[int] = None
 
 class ProductCreateSchema(BaseModel):
     name: str
@@ -469,6 +515,8 @@ class ProductCreateSchema(BaseModel):
     brand: Optional[str] = None
     requires_expiration: Optional[bool] = None
     replenishment_policy: Optional[str] = None
+    visual_presentation: Optional[str] = None
+    product_image_uri: Optional[str] = None
     received_by: Optional[str] = "Anonimo"
     notes: Optional[str] = None
 
@@ -481,12 +529,47 @@ class ProductMasterSchema(BaseModel):
     unit_type: Optional[str] = "unid"
     requires_expiration: bool = False
     replenishment_policy: Optional[str] = "MRP"
+    visual_presentation: Optional[str] = None
+    product_image_uri: Optional[str] = None
     is_active: bool = True
 
 class BranchProductConfigSchema(BaseModel):
     price_per_unit: Optional[float] = None
     is_available: bool = True
     is_exclusive: bool = False
+
+class PromotionItemInputSchema(BaseModel):
+    product_id: int
+    included_qty: float
+    unit_type: str = "unid"
+    sort_order: Optional[int] = 0
+
+class PromotionBranchConfigSchema(BaseModel):
+    branch_id: int
+    promo_price: float
+    enabled: bool = True
+
+class PromotionCreateSchema(BaseModel):
+    name: str
+    description: Optional[str] = None
+    active: bool = True
+    created_by: Optional[str] = "Anonimo"
+    items: List[PromotionItemInputSchema]
+    branch_configs: List[PromotionBranchConfigSchema]
+
+class PromotionUpdateSchema(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    active: Optional[bool] = None
+    items: Optional[List[PromotionItemInputSchema]] = None
+    branch_configs: Optional[List[PromotionBranchConfigSchema]] = None
+
+class PromotionCalculateItemSchema(BaseModel):
+    product_id: int
+    actual_qty: float
+
+class PromotionCalculateRequestSchema(BaseModel):
+    items: List[PromotionCalculateItemSchema]
 
 class IngressCreateSchema(BaseModel):
     product_id: int
@@ -989,6 +1072,8 @@ def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
             "brand": product.brand,
             "barcode": product.barcode,
             "unit_type": product.unit_type,
+            "visual_presentation": product.visual_presentation,
+            "product_image_uri": product.product_image_uri,
             "base_price": product.price_per_unit,
             "branch_price": (
                 config.price_per_unit
@@ -1132,6 +1217,8 @@ def create_product_master(
         previous_cost_price=0,
         requires_expiration=prod.requires_expiration,
         replenishment_policy=prod.replenishment_policy or "MRP",
+        visual_presentation=prod.visual_presentation,
+        product_image_uri=prod.product_image_uri,
         is_active=prod.is_active
     )
 
@@ -1167,6 +1254,280 @@ def create_product_master(
     db.refresh(x)
 
     return x
+
+# ==========================================
+# SECCIÓN: GESTOR DE PROMOCIONES
+# ==========================================
+
+@app.get("/promotions")
+def get_promotions(branch_id: int = 1, db: Session = Depends(get_db)):
+    branch = db.query(BranchDB).filter(BranchDB.id == branch_id, BranchDB.is_active == True).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Sucursal no encontrada")
+    
+    promos = db.query(PromotionDB).all()
+    result = []
+    for promo in promos:
+        b_conf = db.query(PromotionBranchDB).filter(
+            PromotionBranchDB.promotion_id == promo.id,
+            PromotionBranchDB.branch_id == branch_id
+        ).first()
+        
+        enabled = b_conf.enabled if b_conf else True
+        promo_price = b_conf.promo_price if b_conf else 0.0
+
+        items_list = []
+        for item in promo.items:
+            prod = item.product
+            # Obtener el precio normal vigente en la sucursal para este producto
+            prod_config = db.query(BranchProductDB).filter(
+                BranchProductDB.branch_id == branch_id,
+                BranchProductDB.product_id == prod.id
+            ).first()
+            normal_price = prod_config.price_per_unit if (prod_config and prod_config.price_per_unit is not None) else prod.price_per_unit
+
+            items_list.append({
+                "product_id": prod.id,
+                "product_name": prod.name,
+                "barcode": prod.barcode,
+                "included_qty": item.included_qty,
+                "unit_type": item.unit_type,
+                "regular_unit_price": normal_price
+            })
+
+        result.append({
+            "id": promo.id,
+            "name": promo.name,
+            "description": promo.description,
+            "active": promo.active,
+            "branch_id": branch_id,
+            "enabled": enabled,
+            "promo_price": promo_price,
+            "items": items_list
+        })
+    return result
+
+@app.get("/promotions/{promotion_id}")
+def get_promotion_detail(promotion_id: int, branch_id: int = 1, db: Session = Depends(get_db)):
+    promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
+    if not promo:
+        raise HTTPException(status_code=404, detail="Promoción no encontrada")
+    
+    b_conf = db.query(PromotionBranchDB).filter(
+        PromotionBranchDB.promotion_id == promo.id,
+        PromotionBranchDB.branch_id == branch_id
+    ).first()
+
+    items_list = []
+    for item in promo.items:
+        prod = item.product
+        prod_config = db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id == branch_id,
+            BranchProductDB.product_id == prod.id
+        ).first()
+        normal_price = prod_config.price_per_unit if (prod_config and prod_config.price_per_unit is not None) else prod.price_per_unit
+
+        items_list.append({
+            "product_id": prod.id,
+            "product_name": prod.name,
+            "barcode": prod.barcode,
+            "included_qty": item.included_qty,
+            "unit_type": item.unit_type,
+            "regular_unit_price": normal_price
+        })
+
+    return {
+        "id": promo.id,
+        "name": promo.name,
+        "description": promo.description,
+        "active": promo.active,
+        "branch_id": branch_id,
+        "enabled": b_conf.enabled if b_conf else True,
+        "promo_price": b_conf.promo_price if b_conf else 0.0,
+        "items": items_list
+    }
+
+@app.post("/promotions")
+def create_promotion(payload: PromotionCreateSchema, db: Session = Depends(get_db)):
+    promo = PromotionDB(
+        name=payload.name.strip(),
+        description=payload.description,
+        active=payload.active,
+        created_by=payload.created_by
+    )
+    db.add(promo)
+    db.flush()
+
+    for item in payload.items:
+        prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
+        if not prod:
+            raise HTTPException(status_code=404, detail=f"Producto {item.product_id} no encontrado")
+        if item.included_qty <= 0:
+            raise HTTPException(status_code=422, detail="La cantidad incluida debe ser mayor a 0")
+        
+        p_item = PromotionItemDB(
+            promotion_id=promo.id,
+            product_id=prod.id,
+            included_qty=item.included_qty,
+            unit_type=item.unit_type,
+            sort_order=item.sort_order or 0
+        )
+        db.add(p_item)
+
+    for b_conf in payload.branch_configs:
+        branch = db.query(BranchDB).filter(BranchDB.id == b_conf.branch_id).first()
+        if not branch:
+            raise HTTPException(status_code=404, detail=f"Sucursal {b_conf.branch_id} no encontrada")
+        if b_conf.promo_price < 0:
+            raise HTTPException(status_code=422, detail="El precio de promoción no puede ser negativo")
+        
+        pb = PromotionBranchDB(
+            promotion_id=promo.id,
+            branch_id=b_conf.branch_id,
+            promo_price=b_conf.promo_price,
+            enabled=b_conf.enabled
+        )
+        db.add(pb)
+
+    db.commit()
+    db.refresh(promo)
+    return {"status": "success", "promotion_id": promo.id}
+
+@app.put("/promotions/{promotion_id}")
+def update_promotion(promotion_id: int, payload: PromotionUpdateSchema, db: Session = Depends(get_db)):
+    promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
+    if not promo:
+        raise HTTPException(status_code=404, detail="Promoción no encontrada")
+
+    if payload.name is not None:
+        promo.name = payload.name.strip()
+    if payload.description is not None:
+        promo.description = payload.description
+    if payload.active is not None:
+        promo.active = payload.active
+
+    if payload.items is not None:
+        db.query(PromotionItemDB).filter(PromotionItemDB.promotion_id == promo.id).delete()
+        for item in payload.items:
+            prod = db.query(ProductDB).filter(ProductDB.id == item.product_id).first()
+            if not prod:
+                raise HTTPException(status_code=404, detail=f"Producto {item.product_id} no encontrado")
+            p_item = PromotionItemDB(
+                promotion_id=promo.id,
+                product_id=prod.id,
+                included_qty=item.included_qty,
+                unit_type=item.unit_type,
+                sort_order=item.sort_order or 0
+            )
+            db.add(p_item)
+
+    if payload.branch_configs is not None:
+        db.query(PromotionBranchDB).filter(PromotionBranchDB.promotion_id == promo.id).delete()
+        for b_conf in payload.branch_configs:
+            branch = db.query(BranchDB).filter(BranchDB.id == b_conf.branch_id).first()
+            if not branch:
+                raise HTTPException(status_code=404, detail=f"Sucursal {b_conf.branch_id} no encontrada")
+            pb = PromotionBranchDB(
+                promotion_id=promo.id,
+                branch_id=b_conf.branch_id,
+                promo_price=b_conf.promo_price,
+                enabled=b_conf.enabled
+            )
+            db.add(pb)
+
+    db.commit()
+    db.refresh(promo)
+    return {"status": "success", "promotion_id": promo.id}
+
+@app.delete("/promotions/{promotion_id}")
+def delete_promotion(promotion_id: int, db: Session = Depends(get_db)):
+    promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
+    if not promo:
+        raise HTTPException(status_code=404, detail="Promoción no encontrada")
+    
+    # Desactivación lógica o eliminación limpia
+    promo.active = False
+    db.commit()
+    return {"status": "success", "message": "Promoción desactivada correctamente"}
+
+@app.post("/promotions/{promotion_id}/calculate")
+def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: PromotionCalculateRequestSchema = None, db: Session = Depends(get_db)):
+    promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
+    if not promo or not promo.active:
+        raise HTTPException(status_code=404, detail="Promoción no encontrada o inactiva")
+
+    b_conf = db.query(PromotionBranchDB).filter(
+        PromotionBranchDB.promotion_id == promo.id,
+        PromotionBranchDB.branch_id == branch_id
+    ).first()
+
+    if b_conf and not b_conf.enabled:
+        raise HTTPException(status_code=400, detail="La promoción no está habilitada en esta sucursal")
+
+    promo_price = b_conf.promo_price if b_conf else 0.0
+
+    provided_items = {item.product_id: item.actual_qty for item in (payload.items if payload else [])}
+    required_product_ids = {item.product_id for item in promo.items}
+
+    if set(provided_items.keys()) != required_product_ids:
+        raise HTTPException(status_code=422, detail="Los productos provistos no coinciden exactamente con los componentes de la promoción")
+
+    breakdown = []
+    total_extra = 0.0
+
+    for promo_item in promo.items:
+        prod_id = promo_item.product_id
+        actual_qty = provided_items.get(prod_id, 0.0)
+        included_qty = promo_item.included_qty
+
+        if actual_qty < 0:
+            raise HTTPException(status_code=422, detail="La cantidad real no puede ser negativa")
+
+        # Validar disponibilidad y stock en sucursal
+        prod_config = db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id == branch_id,
+            BranchProductDB.product_id == prod_id,
+            BranchProductDB.is_available == True
+        ).first()
+        if not prod_config:
+            raise HTTPException(status_code=409, detail=f"El producto ID {prod_id} no está disponible en esta sucursal")
+
+        branch_stock = get_branch_stock(db, prod_id, branch_id)
+        if branch_stock < actual_qty:
+            raise HTTPException(status_code=409, detail=f"Stock insuficiente para el producto ID {prod_id}")
+
+        regular_price = prod_config.price_per_unit if prod_config.price_per_unit is not None else promo_item.product.price_per_unit
+
+        extra_qty = max(0.0, actual_qty - included_qty)
+        extra_amount = round(extra_qty * regular_price, 2)
+        total_extra += extra_amount
+
+        breakdown.append({
+            "product_id": prod_id,
+            "product_name": promo_item.product.name,
+            "included_qty": included_qty,
+            "actual_qty": actual_qty,
+            "extra_qty": round(extra_qty, 3),
+            "unit_type": promo_item.unit_type,
+            "regular_unit_price": regular_price,
+            "extra_amount": extra_amount
+        })
+
+    final_total = round(promo_price + total_extra, 2)
+
+    return {
+        "promotion_id": promo.id,
+        "promotion_name": promo.name,
+        "branch_id": branch_id,
+        "promo_price": promo_price,
+        "total_extra": round(total_extra, 2),
+        "final_total": final_total,
+        "items": breakdown
+    }
+
+# ==========================================
+# FIN SECCIÓN PROMOCIONES
+# ==========================================
 
 @app.post("/ingresses")
 def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):
@@ -1208,6 +1569,70 @@ def get_ingresses(product_id: Optional[int]=None, branch_id: int = 1, db: Sessio
     q=db.query(ProductIngressDB).filter(ProductIngressDB.branch_id==branch_id)
     if product_id is not None: q=q.filter(ProductIngressDB.product_id==product_id)
     return q.order_by(ProductIngressDB.id.desc()).limit(200).all()
+
+# NUEVO: Historial / buscador avanzado de ingresos
+@app.get("/ingresses/history")
+def get_ingresses_history(
+    branch_id: int = 1,
+    search: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    safe_limit = min(max(limit, 1), 500)
+    query = db.query(ProductIngressDB).join(ProductDB).filter(ProductIngressDB.branch_id == branch_id)
+
+    if date_from:
+        try:
+            dt_from_local = datetime.datetime.strptime(date_from.strip(), "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+            dt_from_utc = ar_to_utc(dt_from_local)
+            query = query.filter(ProductIngressDB.received_at >= dt_from_utc)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Formato de date_from invalido. Usa YYYY-MM-DD.")
+
+    if date_to:
+        try:
+            dt_to_local_day = datetime.datetime.strptime(date_to.strip(), "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
+            next_day_local = dt_to_local_day + datetime.timedelta(days=1)
+            next_day_utc = ar_to_utc(next_day_local)
+            query = query.filter(ProductIngressDB.received_at < next_day_utc)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Formato de date_to invalido. Usa YYYY-MM-DD.")
+
+    if search and search.strip():
+        term = search.strip()
+        query = query.filter(
+            or_(
+                ProductDB.name.ilike(f"%{term}%"),
+                ProductDB.barcode.ilike(f"%{term}%"),
+                ProductIngressDB.supplier.ilike(f"%{term}%"),
+                ProductIngressDB.lot_number.ilike(f"%{term}%")
+            )
+        )
+
+    ingresses = query.order_by(ProductIngressDB.received_at.desc(), ProductIngressDB.id.desc()).limit(safe_limit).all()
+
+    result = []
+    for ing in ingresses:
+        prod = ing.product
+        result.append({
+            "ingress_id": ing.id,
+            "received_at": utc_to_ar(ing.received_at).isoformat() if ing.received_at else None,
+            "received_at_formatted": utc_to_ar(ing.received_at).strftime("%Y-%m-%d %H:%M hs") if ing.received_at else None,
+            "product_id": ing.product_id,
+            "product_name": prod.name if prod else "Desconocido",
+            "barcode": prod.barcode if prod else None,
+            "category": prod.category if prod else None,
+            "quantity": ing.quantity,
+            "unit_type": prod.unit_type if prod else "unid",
+            "unit_cost": ing.cost_price,
+            "supplier": ing.supplier,
+            "lot_code": ing.lot_number,
+            "expiration_date": format_iso_to_ddmmyyyy(ing.expiration_date),
+            "branch_id": ing.branch_id
+        })
+    return result
 
 @app.patch("/ingresses/{ingress_id}")
 def correct_ingress(
@@ -1292,9 +1717,11 @@ def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db)):
         existing.price_per_unit=prod.price_per_unit; existing.unit_type=prod.unit_type or existing.unit_type
         if prod.requires_expiration is not None: existing.requires_expiration=prod.requires_expiration
         if prod.replenishment_policy is not None: existing.replenishment_policy=prod.replenishment_policy
+        if prod.visual_presentation is not None: existing.visual_presentation=prod.visual_presentation
+        if prod.product_image_uri is not None: existing.product_image_uri=prod.product_image_uri
         target=existing
     else:
-        target=ProductDB(name=prod.name.strip(),category=prod.category or "Varios",brand=prod.brand,cost_price=0,previous_cost_price=0,price_per_unit=prod.price_per_unit,supplier=prod.supplier,unit_type=prod.unit_type or "unid",stock=0,barcode=barcode,requires_expiration=bool(prod.requires_expiration),replenishment_policy=prod.replenishment_policy or "MRP",is_active=True)
+        target=ProductDB(name=prod.name.strip(),category=prod.category or "Varios",brand=prod.brand,cost_price=0,previous_cost_price=0,price_per_unit=prod.price_per_unit,supplier=prod.supplier,unit_type=prod.unit_type or "unid",stock=0,barcode=barcode,requires_expiration=bool(prod.requires_expiration),replenishment_policy=prod.replenishment_policy or "MRP",visual_presentation=prod.visual_presentation,product_image_uri=prod.product_image_uri,is_active=True)
         db.add(target); db.flush()
     if prod.stock>0: register_ingress(target,prod.supplier,prod.cost_price or 0,prod.stock,prod.lot_number,prod.expiration_date,prod.received_by,prod.notes,db)
     db.commit(); db.refresh(target); return target
@@ -1307,11 +1734,25 @@ def update_product(product_id:int, prod:ProductCreateSchema, db:Session=Depends(
     if barcode and db.query(ProductDB).filter(ProductDB.barcode==barcode,ProductDB.id!=product_id).first():
         raise HTTPException(status_code=409,detail="EAN ya asociado a otro producto")
     old_price=x.price_per_unit
-    changes={"name":(x.name,prod.name.strip()),"category":(x.category,prod.category),"brand":(x.brand,prod.brand),"price_per_unit":(x.price_per_unit,prod.price_per_unit),"supplier":(x.supplier,prod.supplier),"unit_type":(x.unit_type,prod.unit_type),"barcode":(x.barcode,barcode),"requires_expiration":(x.requires_expiration,prod.requires_expiration if prod.requires_expiration is not None else x.requires_expiration),"replenishment_policy":(x.replenishment_policy,prod.replenishment_policy if prod.replenishment_policy is not None else x.replenishment_policy)}
+    changes={
+        "name":(x.name,prod.name.strip()),
+        "category":(x.category,prod.category),
+        "brand":(x.brand,prod.brand),
+        "price_per_unit":(x.price_per_unit,prod.price_per_unit),
+        "supplier":(x.supplier,prod.supplier),
+        "unit_type":(x.unit_type,prod.unit_type),
+        "barcode":(x.barcode,barcode),
+        "requires_expiration":(x.requires_expiration,prod.requires_expiration if prod.requires_expiration is not None else x.requires_expiration),
+        "replenishment_policy":(x.replenishment_policy,prod.replenishment_policy if prod.replenishment_policy is not None else x.replenishment_policy),
+        "visual_presentation":(x.visual_presentation,prod.visual_presentation),
+        "product_image_uri":(x.product_image_uri,prod.product_image_uri)
+    }
     x.name=prod.name.strip(); x.category=prod.category; x.brand=prod.brand; x.price_per_unit=prod.price_per_unit
     x.supplier=prod.supplier; x.unit_type=prod.unit_type; x.barcode=barcode
     if prod.requires_expiration is not None: x.requires_expiration=prod.requires_expiration
     if prod.replenishment_policy is not None: x.replenishment_policy=prod.replenishment_policy
+    if prod.visual_presentation is not None: x.visual_presentation=prod.visual_presentation
+    if prod.product_image_uri is not None: x.product_image_uri=prod.product_image_uri
     x.is_active=prod.is_active if prod.is_active is not None else x.is_active
     actor=prod.received_by or "Anonimo"
     for field,(old,new) in changes.items():
@@ -1614,7 +2055,9 @@ def serialize_sale_ticket(sale: SaleDB):
                 "quantity": item.quantity,
                 "unit_type": u_type,
                 "unit_price": item.unit_price,
-                "subtotal": round(item.quantity * item.unit_price, 2)
+                "subtotal": round(item.quantity * item.unit_price, 2),
+                "is_promotion": getattr(item, "is_promotion", False),
+                "promotion_id": getattr(item, "promotion_id", None)
             })
         return {
             "id": sale.id,
@@ -1673,9 +2116,13 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
         if item.quantity<=0 or get_branch_stock(db,x.id,branch_id)<item.quantity:
             raise HTTPException(status_code=409, detail=f"Stock insuficiente o cantidad invalida: {x.name}")
         products[item.product_id]=x
+
+    # Si es una venta de promoción, podemos calcular o aceptar los precios unitarios/proporcionales.
+    # Como la estructura de items soporta cantidades reales (actual_qty), consumimos stock real con FEFO.
     for item in payload.items:
         x=products[item.product_id]
         cost=consume_stock_fefo(x, item.quantity, "SALE", payload.sold_by or "Anonimo", "Venta", db, "sale", sale.id, branch_id=branch_id)
+        
         branch_config=db.query(BranchProductDB).filter(
             BranchProductDB.branch_id==branch_id,
             BranchProductDB.product_id==x.id,
@@ -1693,8 +2140,23 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
             ).first()
             if psi:
                 unit_price=psi.price_per_unit or unit_price
+
+        # Si se especificó una venta de promoción, podemos distribuir el precio o registrar los ítems con sus marcas de promo
         revenue=unit_price*item.quantity
-        db.add(SaleItemDB(sale_id=sale.id, product_id=x.id, product_name=x.name, quantity=item.quantity, unit_type=x.unit_type, unit_price=unit_price, unit_cost=cost/item.quantity if item.quantity > 0 else 0, cogs=cost, gross_profit=revenue-cost))
+        db.add(SaleItemDB(
+            sale_id=sale.id,
+            product_id=x.id,
+            product_name=x.name,
+            quantity=item.quantity,
+            unit_type=x.unit_type,
+            unit_price=unit_price,
+            unit_cost=cost/item.quantity if item.quantity > 0 else 0,
+            cogs=cost,
+            gross_profit=revenue-cost,
+            is_promotion=bool(payload.is_promotion),
+            promotion_id=payload.promotion_id
+        ))
+
     if presale:
         presale.status = "COMPLETADA"
     db.commit()

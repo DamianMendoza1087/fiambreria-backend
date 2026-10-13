@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+from decimal import Decimal
 
 import pytest
 
@@ -366,3 +367,87 @@ def test_existing_db_keeps_data_when_new_tables_are_created(tmp_path):
     conn.close()
     assert after == before  # productos, ventas, promociones, usuarios y sucursales intactos
     assert {"fair_cost_configs", "day_plans", "day_plan_snapshots"} <= names
+
+
+# ---------- Validación de umbrales y montos ----------
+
+@pytest.mark.parametrize("payload", [
+    {"green_max_stock_pct": 0.85},                                # verde == amarillo
+    {"green_max_stock_pct": 0.9},                                 # verde > amarillo
+    {"green_max_stock_pct": 0.7, "yellow_max_stock_pct": 0.65},
+    {"green_max_stock_pct": -0.1},
+    {"yellow_max_stock_pct": 1.2},
+    {"safety_margin_pct": -0.01},
+    {"safety_margin_pct": 1.5},
+    {"incomplete_data_tolerance_pct": 2},
+    {"minimum_comparable_days": 9},                               # > comparable_days_count (8)
+    {"comparable_days_count": 2},                                 # mínimo (3) > comparables
+    {"comparable_days_count": 0},
+    {"stall_cost_per_day": -1},
+    {"staff_cost_per_person_day": -0.01},
+    {"transport_outbound": -100},
+    {"transport_return": -100},
+    {"staff_count": -1},
+])
+def test_fair_config_rejects_incoherent_values(payload):
+    r = client.put("/branches/2/fair-config", json=payload)
+    assert r.status_code == 422, (payload, r.text)
+    conn = sqlite3.connect(_DB_PATH)
+    assert conn.execute("SELECT COUNT(*) FROM fair_cost_configs").fetchone()[0] == 0
+    conn.close()
+
+
+def test_fair_config_rejects_nan():
+    r = client.put("/branches/2/fair-config", content='{"stall_cost_per_day": NaN}',
+                   headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+# ---------- Persistencia monetaria ----------
+
+MONEY_COLUMNS = {
+    "fair_cost_configs": {"stall_cost_per_day", "staff_cost_per_person_day", "transport_outbound",
+                          "transport_return"},
+    "day_plans": {"stall_total", "staff_total", "transport_outbound", "transport_return", "transport_total",
+                  "other_expenses", "debt_target", "profit_target", "capital_available", "manual_expected_sales"},
+}
+
+
+def test_money_columns_are_numeric_and_percentages_unchanged():
+    conn = sqlite3.connect(_DB_PATH)
+    for table, money_cols in MONEY_COLUMNS.items():
+        types = {r[1]: r[2] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col in money_cols:
+            assert types[col] == "NUMERIC(18, 2)", (table, col, types[col])
+        for col in ("green_max_stock_pct", "yellow_max_stock_pct", "safety_margin_pct",
+                    "incomplete_data_tolerance_pct"):
+            assert types[col] == "FLOAT", (table, col)
+    conn.close()
+
+
+def test_money_values_round_trip_to_exact_cents():
+    add_lot(add_product("Jamón"), 1000, 1000)
+    cfg = client.put("/branches/2/fair-config", json={"stall_cost_per_day": 120000.10}).json()
+    assert cfg["stall_cost_per_day"] == 120000.10
+    body = client.post("/day-plans", json=weekend_payload(other_expenses=1234.565, debt_target=0.1,
+                                                          capital_available=99999999.99,
+                                                          manual_expected_sales=0.3)).json()
+    plan = body["plan"]
+    assert plan["other_expenses"] == 1234.57      # redondeo a centavos antes de guardar
+    assert plan["stall_total"] == 240000.20       # 120.000,10 × 2 exacto
+    assert plan["debt_target"] == 0.1 and plan["capital_available"] == 99999999.99
+    db = main.SessionLocal()
+    stored = db.query(main.DayPlanDB).filter(main.DayPlanDB.id == plan["id"]).first()
+    assert stored.other_expenses == Decimal("1234.57")
+    assert stored.stall_total == Decimal("240000.20")
+    assert stored.manual_expected_sales == Decimal("0.30")
+    assert isinstance(stored.capital_available, Decimal)
+    cfg_row = db.query(main.FairCostConfigDB).first()
+    assert cfg_row.stall_cost_per_day == Decimal("120000.10")
+    db.close()
+    res = body["latest_snapshot"]["results"]
+    assert res["operating_costs"]["opex"] == 240000.20 + 200000 + 60000 + 1234.57
+    assert res["targets"]["debt_target"] == 0.1
+    # Recalcular lee los Numeric y sigue dando lo mismo.
+    again = client.post(f"/day-plans/{plan['id']}/recalculate").json()["latest_snapshot"]["results"]
+    assert again["operating_costs"] == res["operating_costs"]

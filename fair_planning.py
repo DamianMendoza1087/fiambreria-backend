@@ -66,6 +66,11 @@ def D(value) -> Decimal:
     return Decimal(str(value))
 
 
+def to_cents(value) -> Decimal:
+    """Importe redondeado a centavos (para persistir en columnas Numeric(18, 2))."""
+    return D(value).quantize(CENT, rounding=ROUND_HALF_UP)
+
+
 def money(value: Optional[Decimal]) -> Optional[float]:
     if value is None:
         return None
@@ -313,10 +318,15 @@ def capital_analysis(g_obj: Decimal, g_eq: Decimal, total_gm: Decimal, capital_a
     result = {"capital_available": capital_available, "margin_gap": max(delta, ZERO),
               "replacement_margin": rep.get("margin"), "replacement_basis": rep.get("basis"),
               "products_without_replacement_cost": rep.get("products_without_replacement_cost", [])}
-    m_rep = rep.get("margin") if rep.get("available") else None
-    rentable = m_rep is not None and m_rep > 0
+    m_rep = D(rep["margin"]) if rep.get("available") and rep.get("margin") is not None else None
+    # Rango económico válido: 0 < m_rep < 1. Con m_rep >= 1 la reposición costaría 0 o menos
+    # (dato imposible) y la fórmula dividiría por cero o daría resultados sin sentido.
+    rentable = m_rep is not None and ZERO < m_rep < ONE
+    invalid_margin = m_rep is not None and m_rep >= ONE
     # Margen adicional alcanzable comprando stock con el capital disponible.
     result["margin_reachable_with_capital"] = (capital_available * m_rep / (ONE - m_rep)) if rentable else ZERO
+    if invalid_margin:
+        result["replacement_margin_valid"] = False
     if delta <= 0:
         result.update({"purchase_needed": False, "capital_required": ZERO,
                        "capital_difference": capital_available})
@@ -325,6 +335,9 @@ def capital_analysis(g_obj: Decimal, g_eq: Decimal, total_gm: Decimal, capital_a
     if not rep.get("available"):
         result.update({"capital_required": None, "capital_difference": None,
                        "reason": rep.get("reason")})
+    elif invalid_margin:
+        result.update({"capital_required": None, "capital_difference": None,
+                       "reason": "MARGEN_REPOSICION_INVALIDO"})
     elif not rentable:
         result.update({"capital_required": None, "capital_difference": None,
                        "reason": "REPOSICION_NO_RENTABLE"})
@@ -576,6 +589,9 @@ def compute_day_plan(plan: dict, thresholds: dict, lots: List[dict], products: D
         warnings.append({"code": "SIN_COSTO_DE_REPOSICION",
                          "detail": f"{len(capital['products_without_replacement_cost'])} producto(s) sin ingreso "
                                    "válido en Feria para estimar reposición"})
+    if capital.get("replacement_margin_valid") is False:
+        warnings.append({"code": "MARGEN_REPOSICION_INVALIDO",
+                         "detail": "El margen de reposición calculado está fuera del rango válido (0 a 1)"})
     if capital["purchase_needed"] and capital.get("capital_required") is None:
         warnings.append({"code": capital.get("reason") or "CAPITAL_NO_CALCULABLE",
                          "detail": "No puede calcularse una reposición rentable con los datos actuales"})

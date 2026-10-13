@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text, or_
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text, or_, Numeric
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from pydantic import BaseModel
@@ -10,8 +10,9 @@ import datetime
 from zoneinfo import ZoneInfo
 from db_config import load_database_config, verify_database_after_init, database_health
 import json
+from decimal import Decimal
 import fair_planning
-from fair_planning import D
+from fair_planning import D, to_cents
 
 # Valida configuración/ruta y, en producción, que la base exista y sea válida
 # (o que su creación esté autorizada) ANTES de cualquier create_all/init_db.
@@ -303,17 +304,20 @@ class InventoryCountDB(Base):
 
 # ===== OBJETIVO DE JORNADA — FERIA (tablas nuevas; create_all solo las agrega) =====
 
+# Importes de dinero de las tablas nuevas: Numeric con centavos (los porcentajes siguen en Float).
+MONEY_COLUMN_TYPE = Numeric(18, 2, asdecimal=True)
+
 class FairCostConfigDB(Base):
     __tablename__ = "fair_cost_configs"
     id = Column(Integer, primary_key=True, index=True)
     branch_id = Column(Integer, ForeignKey("branches.id"), nullable=False, index=True)
     version = Column(Integer, nullable=False)
     is_current = Column(Boolean, default=True, index=True)
-    stall_cost_per_day = Column(Float, nullable=False)
+    stall_cost_per_day = Column(MONEY_COLUMN_TYPE, nullable=False)
     staff_count = Column(Integer, nullable=False)
-    staff_cost_per_person_day = Column(Float, nullable=False)
-    transport_outbound = Column(Float, nullable=False)
-    transport_return = Column(Float, nullable=False)
+    staff_cost_per_person_day = Column(MONEY_COLUMN_TYPE, nullable=False)
+    transport_outbound = Column(MONEY_COLUMN_TYPE, nullable=False)
+    transport_return = Column(MONEY_COLUMN_TYPE, nullable=False)
     green_max_stock_pct = Column(Float, nullable=False)
     yellow_max_stock_pct = Column(Float, nullable=False)
     safety_margin_pct = Column(Float, nullable=False)
@@ -332,16 +336,16 @@ class DayPlanDB(Base):
     start_date = Column(String, nullable=False)   # ISO AAAA-MM-DD
     end_date = Column(String, nullable=False)
     days_count = Column(Integer, nullable=False)
-    stall_total = Column(Float, nullable=False)
-    staff_total = Column(Float, nullable=False)
-    transport_outbound = Column(Float, nullable=False)
-    transport_return = Column(Float, nullable=False)
-    transport_total = Column(Float, nullable=False)
-    other_expenses = Column(Float, default=0.0)
-    debt_target = Column(Float, default=0.0)
-    profit_target = Column(Float, default=0.0)
-    capital_available = Column(Float, default=0.0)
-    manual_expected_sales = Column(Float, nullable=True)
+    stall_total = Column(MONEY_COLUMN_TYPE, nullable=False)
+    staff_total = Column(MONEY_COLUMN_TYPE, nullable=False)
+    transport_outbound = Column(MONEY_COLUMN_TYPE, nullable=False)
+    transport_return = Column(MONEY_COLUMN_TYPE, nullable=False)
+    transport_total = Column(MONEY_COLUMN_TYPE, nullable=False)
+    other_expenses = Column(MONEY_COLUMN_TYPE, default=Decimal("0.00"))
+    debt_target = Column(MONEY_COLUMN_TYPE, default=Decimal("0.00"))
+    profit_target = Column(MONEY_COLUMN_TYPE, default=Decimal("0.00"))
+    capital_available = Column(MONEY_COLUMN_TYPE, default=Decimal("0.00"))
+    manual_expected_sales = Column(MONEY_COLUMN_TYPE, nullable=True)
     config_id = Column(Integer, ForeignKey("fair_cost_configs.id"), nullable=True)
     config_version = Column(Integer, nullable=True)  # None = valores por defecto
     green_max_stock_pct = Column(Float, nullable=False)
@@ -2947,8 +2951,8 @@ def _validate_fair_config(values: dict):
             raise HTTPException(status_code=422, detail=f"{k} debe estar entre 0 y 1")
     if D(values["green_max_stock_pct"]) <= 0:
         raise HTTPException(status_code=422, detail="green_max_stock_pct debe ser mayor a 0")
-    if D(values["green_max_stock_pct"]) > D(values["yellow_max_stock_pct"]):
-        raise HTTPException(status_code=422, detail="green_max_stock_pct no puede superar yellow_max_stock_pct")
+    if D(values["green_max_stock_pct"]) >= D(values["yellow_max_stock_pct"]):
+        raise HTTPException(status_code=422, detail="green_max_stock_pct debe ser menor que yellow_max_stock_pct")
     if not isinstance(values["comparable_days_count"], int) or not 1 <= values["comparable_days_count"] <= 52:
         raise HTTPException(status_code=422, detail="comparable_days_count debe estar entre 1 y 52")
     if not isinstance(values["minimum_comparable_days"], int) or not 1 <= values["minimum_comparable_days"] <= values["comparable_days_count"]:
@@ -2978,7 +2982,8 @@ def update_fair_config(branch_id: int, payload: FairConfigUpdateSchema, db: Sess
     row = FairCostConfigDB(
         branch_id=branch_id, version=last_version + 1, is_current=True,
         created_by=payload.updated_by, notes=payload.notes,
-        **{k: (float(D(values[k])) if k in FAIR_MONEY_CONFIG_FIELDS + FAIR_PCT_CONFIG_FIELDS else values[k])
+        **{k: (to_cents(values[k]) if k in FAIR_MONEY_CONFIG_FIELDS
+               else float(D(values[k])) if k in FAIR_PCT_CONFIG_FIELDS else values[k])
            for k in fair_planning.DEFAULT_FAIR_CONFIG}
     )
     db.add(row)
@@ -3007,7 +3012,7 @@ def _money_input(value, field: str, required: bool = False):
     v = D(value)
     if not v.is_finite() or v < 0:
         raise HTTPException(status_code=422, detail=f"{field} debe ser un importe mayor o igual a 0")
-    return v
+    return to_cents(v)
 
 
 def _config_for_plan(db: Session, plan) -> dict:
@@ -3060,15 +3065,15 @@ def _resolve_plan_inputs(data: dict, config: dict) -> dict:
     stall = _money_input(data.get("stall_total"), "stall_total")
     staff = _money_input(data.get("staff_total"), "staff_total")
     if stall is None:
-        stall = D(config["stall_cost_per_day"]) * days
+        stall = to_cents(D(config["stall_cost_per_day"]) * days)
     if staff is None:
-        staff = D(config["staff_cost_per_person_day"]) * config["staff_count"] * days
+        staff = to_cents(D(config["staff_cost_per_person_day"]) * config["staff_count"] * days)
 
     t_out = _money_input(data.get("transport_outbound"), "transport_outbound")
     t_ret = _money_input(data.get("transport_return"), "transport_return")
     if plan_type == "FIN_DE_SEMANA":
-        t_out = D(config["transport_outbound"]) if t_out is None else t_out
-        t_ret = D(config["transport_return"]) if t_ret is None else t_ret
+        t_out = to_cents(config["transport_outbound"]) if t_out is None else t_out
+        t_ret = to_cents(config["transport_return"]) if t_ret is None else t_ret
     elif t_out is None or t_ret is None:
         # Para jornadas individuales el transporte se define al crear el plan (puede ser 0).
         raise HTTPException(status_code=422, detail="Indicá transport_outbound y transport_return para este tipo de jornada (pueden ser 0).")
@@ -3176,6 +3181,9 @@ def _fmt_ddmmyyyy(iso: Optional[str]) -> Optional[str]:
 
 def _plan_out(plan) -> dict:
     out = {c.name: getattr(plan, c.name) for c in DayPlanDB.__table__.columns}
+    for k, v in out.items():
+        if isinstance(v, Decimal):
+            out[k] = fair_planning.money(v)
     out["start_date_display"] = _fmt_ddmmyyyy(plan.start_date)
     out["end_date_display"] = _fmt_ddmmyyyy(plan.end_date)
     for k in ("created_at", "updated_at"):
@@ -3205,8 +3213,8 @@ def _apply_resolved(plan, resolved: dict):
     for k, v in resolved.items():
         if isinstance(v, datetime.date):
             v = v.isoformat()
-        elif isinstance(v, fair_planning.Decimal):
-            v = float(v)
+        elif isinstance(v, Decimal):
+            v = to_cents(v)
         setattr(plan, k, v)
 
 

@@ -381,3 +381,55 @@ def test_result_blocks_present():
 @pytest.mark.parametrize("value", [0.1, 0.2, 1234.56])
 def test_money_rounding_is_decimal_exact(value):
     assert fp.money(D(value) * 3) == float(Decimal(str(value)) * 3)
+
+
+# ---------- Margen de reposición fuera de rango ----------
+
+def _rep(margin):
+    return {"available": True, "margin": D(margin), "basis": "STOCK_ACTUAL",
+            "products_without_replacement_cost": []}
+
+
+@pytest.mark.parametrize("margin,reason", [
+    ("1", "MARGEN_REPOSICION_INVALIDO"),
+    ("1.5", "MARGEN_REPOSICION_INVALIDO"),
+    ("0", "REPOSICION_NO_RENTABLE"),
+    ("-0.2", "REPOSICION_NO_RENTABLE"),
+])
+def test_capital_with_replacement_margin_out_of_range(margin, reason):
+    # Falta margen (G_obj 700.000 > MB 600.000): no debe romper ni calcular capital.
+    cap = fp.capital_analysis(D(700000), D(500000), D(600000), D(1000000), _rep(margin))
+    assert cap["purchase_needed"] is True
+    assert cap["capital_required"] is None and cap["capital_difference"] is None
+    assert cap["reason"] == reason
+    assert cap["margin_reachable_with_capital"] == 0
+    assert "capital_required_for_equilibrium" not in cap
+
+
+@pytest.mark.parametrize("margin", ["1", "1.5"])
+def test_invalid_replacement_margin_without_purchase_is_flagged(margin):
+    cap = fp.capital_analysis(D(500000), D(500000), D(600000), D(1000000), _rep(margin))
+    assert cap["purchase_needed"] is False
+    assert cap["replacement_margin_valid"] is False
+    assert cap["margin_reachable_with_capital"] == 0
+
+
+def test_invalid_replacement_margin_cannot_rescue_equilibrium():
+    # MB 400.000 < OPEX 500.000: un margen de reposición inválido no puede "salvar" la jornada.
+    stock = {"margin": D("0.5"), "total_gross_margin": D(400000), "incomplete_pct": D(0), "unvalued_excluded": 0}
+    tg = fp.targets(D(500000), D(0), D(0))
+    cap = fp.capital_analysis(tg["g_obj"], tg["g_eq"], D(400000), D(10 ** 9), _rep("1"))
+    cons = {"reachable_with_stock": False, "stock_pct": None}
+    eco = fp.economic_verdict(stock, tg, THRESHOLDS, cons, cap)
+    assert eco["verdict"] == "NO_VIABLE"
+
+
+def test_valid_replacement_margin_boundaries():
+    cap = fp.capital_analysis(D(700000), D(500000), D(600000), D(0), _rep("0.9999"))
+    assert cap["capital_required"] is not None and cap["capital_required"] > 0
+
+
+def test_to_cents_rounds_half_up():
+    assert fp.to_cents("1234.565") == Decimal("1234.57")
+    assert fp.to_cents(0.1) == Decimal("0.10")
+    assert fp.to_cents(Decimal("0.1") + Decimal("0.2")) == Decimal("0.30")

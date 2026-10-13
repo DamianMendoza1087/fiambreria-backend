@@ -8,9 +8,16 @@ from pydantic import BaseModel
 from typing import List, Optional
 import datetime
 from zoneinfo import ZoneInfo
+from db_config import load_database_config, verify_database_after_init, database_health
 
-SQLALCHEMY_DATABASE_URL = "sqlite:///./fiambreria.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+# Valida configuración/ruta y, en producción, que la base exista y sea válida
+# (o que su creación esté autorizada) ANTES de cualquier create_all/init_db.
+DB_CONFIG = load_database_config()
+SQLALCHEMY_DATABASE_URL = DB_CONFIG.url
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL,
+    connect_args={"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {}
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -502,6 +509,11 @@ def init_db():
     db.close()
 
 init_db()
+verify_database_after_init(DB_CONFIG)
+
+@app.get("/health")
+def health():
+    return database_health(DB_CONFIG, engine)
 
 class AuditSchema(BaseModel):
     counted_qty: float

@@ -1,4 +1,3 @@
-from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text, or_
@@ -145,6 +144,7 @@ class ProductIngressDB(Base):
     received_at = Column(DateTime, default=datetime.datetime.utcnow)
     received_by = Column(String, nullable=True)
     notes = Column(Text, nullable=True)
+    product = relationship("ProductDB")
 
 class StockMovementDB(Base):
     __tablename__ = "stock_movements"
@@ -442,12 +442,45 @@ def parse_date_to_iso(date_str: Optional[str]) -> Optional[str]:
             pass
     raise HTTPException(status_code=422, detail="Fecha de vencimiento invalida. Usa DD/MM/AAAA o AAAA-MM-DD.")
 
-def format_iso_to_ddmmyyyy(iso_str: str) -> str:
+def parse_arg_date_filter(date_str: Optional[str], is_end: bool = False) -> Optional[datetime.datetime]:
+    if date_str is None or not str(date_str).strip():
+        return None
+    value = str(date_str).strip()
+    dt_local = None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            dt_local = datetime.datetime.strptime(value, fmt)
+            break
+        except ValueError:
+            pass
+    if dt_local is None:
+        raise HTTPException(status_code=422, detail="Fecha inválida. Usá DD/MM/AAAA.")
+    
+    dt_local = dt_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if is_end:
+        dt_local = dt_local + datetime.timedelta(days=1)
+    return ar_to_utc(dt_local)
+
+def format_iso_to_ddmmyyyy(iso_input) -> str:
+    if not iso_input:
+        return ""
+    if isinstance(iso_input, (datetime.date, datetime.datetime)):
+        return iso_input.strftime("%d/%m/%Y")
+    
+    iso_str = str(iso_input).strip()
     if not iso_str:
         return ""
+    
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            dt = datetime.datetime.strptime(iso_str.split("+")[0].split("Z")[0], fmt)
+            return dt.strftime("%d/%m/%Y")
+        except ValueError:
+            pass
+
     parts = iso_str.split('-')
     if len(parts) == 3 and len(parts[0]) == 4:
-        return f"{parts[2]}-{parts[1]}-{parts[0]}"
+        return f"{parts[2]}/{parts[1]}/{parts[0]}"
     return iso_str
 
 def init_db():
@@ -1680,24 +1713,15 @@ def get_ingresses_history(
     db: Session = Depends(get_db)
 ):
     safe_limit = min(max(limit, 1), 500)
-    query = db.query(ProductIngressDB).join(ProductDB).filter(ProductIngressDB.branch_id == branch_id)
+    query = db.query(ProductIngressDB).join(ProductDB, ProductIngressDB.product_id == ProductDB.id).filter(ProductIngressDB.branch_id == branch_id)
 
     if date_from:
-        try:
-            dt_from_local = datetime.datetime.strptime(date_from.strip(), "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
-            dt_from_utc = ar_to_utc(dt_from_local)
-            query = query.filter(ProductIngressDB.received_at >= dt_from_utc)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Formato de date_from invalido. Usa YYYY-MM-DD.")
+        dt_from_utc = parse_arg_date_filter(date_from, is_end=False)
+        query = query.filter(ProductIngressDB.received_at >= dt_from_utc)
 
     if date_to:
-        try:
-            dt_to_local_day = datetime.datetime.strptime(date_to.strip(), "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
-            next_day_local = dt_to_local_day + datetime.timedelta(days=1)
-            next_day_utc = ar_to_utc(next_day_local)
-            query = query.filter(ProductIngressDB.received_at < next_day_utc)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Formato de date_to invalido. Usa YYYY-MM-DD.")
+        dt_to_utc = parse_arg_date_filter(date_to, is_end=True)
+        query = query.filter(ProductIngressDB.received_at < dt_to_utc)
 
     if search and search.strip():
         term = search.strip()
@@ -1718,7 +1742,7 @@ def get_ingresses_history(
         result.append({
             "ingress_id": ing.id,
             "received_at": utc_to_ar(ing.received_at).isoformat() if ing.received_at else None,
-            "received_at_formatted": utc_to_ar(ing.received_at).strftime("%Y-%m-%d %H:%M hs") if ing.received_at else None,
+            "received_at_formatted": utc_to_ar(ing.received_at).strftime("%d/%m/%Y %H:%M hs") if ing.received_at else None,
             "product_id": ing.product_id,
             "product_name": prod.name if prod else "Desconocido",
             "barcode": prod.barcode if prod else None,
@@ -2321,21 +2345,12 @@ def get_sales_history(
     query = db.query(SaleDB).filter(SaleDB.branch_id == branch_id)
 
     if date_from:
-        try:
-            dt_from_local = datetime.datetime.strptime(date_from.strip(), "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
-            dt_from_utc = ar_to_utc(dt_from_local)
-            query = query.filter(SaleDB.created_at >= dt_from_utc)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Formato de date_from invalido. Usa YYYY-MM-DD.")
+        dt_from_utc = parse_arg_date_filter(date_from, is_end=False)
+        query = query.filter(SaleDB.created_at >= dt_from_utc)
 
     if date_to:
-        try:
-            dt_to_local_day = datetime.datetime.strptime(date_to.strip(), "%Y-%m-%d").replace(hour=0, minute=0, second=0, microsecond=0)
-            next_day_local = dt_to_local_day + datetime.timedelta(days=1)
-            next_day_utc = ar_to_utc(next_day_local)
-            query = query.filter(SaleDB.created_at < next_day_utc)
-        except ValueError:
-            raise HTTPException(status_code=422, detail="Formato de date_to invalido. Usa YYYY-MM-DD.")
+        dt_to_utc = parse_arg_date_filter(date_to, is_end=True)
+        query = query.filter(SaleDB.created_at < dt_to_utc)
 
     if search and search.strip():
         term = search.strip()

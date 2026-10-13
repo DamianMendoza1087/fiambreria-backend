@@ -1556,6 +1556,7 @@ def _calculate_promotion_breakdown(promotion_id: int, branch_id: int, items_inpu
     breakdown = []
     total_extra = 0.0
     sum_peso_valor = 0.0
+    regular_actual_total = 0.0
 
     temp_items = []
     for promo_item in promo.items:
@@ -1583,6 +1584,9 @@ def _calculate_promotion_breakdown(promotion_id: int, branch_id: int, items_inpu
         peso_valor = included_qty * regular_price
         sum_peso_valor += peso_valor
 
+        regular_actual_value = round(actual_qty * regular_price, 2)
+        regular_actual_total += regular_actual_value
+
         temp_items.append({
             "promo_item": promo_item,
             "prod_config": prod_config,
@@ -1591,10 +1595,12 @@ def _calculate_promotion_breakdown(promotion_id: int, branch_id: int, items_inpu
             "extra_qty": extra_qty,
             "extra_amount": extra_amount,
             "regular_price": regular_price,
-            "peso_valor": peso_valor
+            "peso_valor": peso_valor,
+            "regular_actual_value": regular_actual_value
         })
 
     expected_total = round(promo_price + total_extra, 2)
+    regular_actual_total = round(regular_actual_total, 2)
 
     assigned_base_sum = 0.0
     processed = 0
@@ -1622,15 +1628,16 @@ def _calculate_promotion_breakdown(promotion_id: int, branch_id: int, items_inpu
             "regular_price": t["regular_price"],
             "extra_amount": t["extra_amount"],
             "base_asignada": base_asignada,
-            "revenue_item": revenue_item
+            "revenue_item": revenue_item,
+            "regular_actual_value": t["regular_actual_value"]
         })
 
-    return expected_total, calculated_items
+    return expected_total, calculated_items, regular_actual_total
 
 @app.post("/promotions/{promotion_id}/calculate")
 def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: PromotionCalculateRequestSchema = None, db: Session = Depends(get_db)):
     items_input = [ItemSchema(product_id=i.product_id, quantity=i.actual_qty) for i in (payload.items if payload else [])]
-    expected_total, calculated_items = _calculate_promotion_breakdown(promotion_id, branch_id, items_input, db)
+    expected_total, calculated_items, regular_actual_total = _calculate_promotion_breakdown(promotion_id, branch_id, items_input, db)
     
     promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
     b_conf = db.query(PromotionBranchDB).filter(PromotionBranchDB.promotion_id == promo.id, PromotionBranchDB.branch_id == branch_id).first()
@@ -1645,7 +1652,8 @@ def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: Promotio
             "actual_qty": c["actual_qty"],
             "unit_type": c["unit_type"],
             "regular_unit_price": c["regular_price"],
-            "extra_amount": c["extra_amount"]
+            "extra_amount": c["extra_amount"],
+            "regular_actual_value": c["regular_actual_value"]
         })
 
     return {
@@ -1653,6 +1661,7 @@ def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: Promotio
         "promotion_name": promo.name,
         "branch_id": branch_id,
         "promo_price": promo_price,
+        "regular_actual_total": regular_actual_total,
         "total_extra": total_extra,
         "final_total": expected_total,
         "items": breakdown
@@ -2239,7 +2248,7 @@ def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session =
     if is_promo:
         if not payload.promotion_id:
             raise HTTPException(status_code=422, detail="promotion_id es obligatorio para ventas de promoción")
-        expected_total, calculated_promo_items = _calculate_promotion_breakdown(payload.promotion_id, branch_id, payload.items, db)
+        expected_total, calculated_promo_items, _ = _calculate_promotion_breakdown(payload.promotion_id, branch_id, payload.items, db)
         if abs(payload.total_amount - expected_total) > 0.05:
             raise HTTPException(status_code=422, detail=f"El total de la venta (${payload.total_amount}) no coincide con el total esperado de la promoción (${expected_total})")
 

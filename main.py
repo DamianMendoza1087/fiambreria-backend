@@ -9,6 +9,9 @@ from typing import List, Optional
 import datetime
 from zoneinfo import ZoneInfo
 from db_config import load_database_config, verify_database_after_init, database_health
+import json
+import fair_planning
+from fair_planning import D
 
 # Valida configuración/ruta y, en producción, que la base exista y sea válida
 # (o que su creación esté autorizada) ANTES de cualquier create_all/init_db.
@@ -297,6 +300,74 @@ class InventoryCountDB(Base):
     difference = Column(Float, default=0.0)
     reported_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+# ===== OBJETIVO DE JORNADA — FERIA (tablas nuevas; create_all solo las agrega) =====
+
+class FairCostConfigDB(Base):
+    __tablename__ = "fair_cost_configs"
+    id = Column(Integer, primary_key=True, index=True)
+    branch_id = Column(Integer, ForeignKey("branches.id"), nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    is_current = Column(Boolean, default=True, index=True)
+    stall_cost_per_day = Column(Float, nullable=False)
+    staff_count = Column(Integer, nullable=False)
+    staff_cost_per_person_day = Column(Float, nullable=False)
+    transport_outbound = Column(Float, nullable=False)
+    transport_return = Column(Float, nullable=False)
+    green_max_stock_pct = Column(Float, nullable=False)
+    yellow_max_stock_pct = Column(Float, nullable=False)
+    safety_margin_pct = Column(Float, nullable=False)
+    incomplete_data_tolerance_pct = Column(Float, nullable=False)
+    comparable_days_count = Column(Integer, nullable=False)
+    minimum_comparable_days = Column(Integer, nullable=False)
+    created_by = Column(String, nullable=True)
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class DayPlanDB(Base):
+    __tablename__ = "day_plans"
+    id = Column(Integer, primary_key=True, index=True)
+    branch_id = Column(Integer, ForeignKey("branches.id"), nullable=False, index=True)
+    plan_type = Column(String, nullable=False)
+    start_date = Column(String, nullable=False)   # ISO AAAA-MM-DD
+    end_date = Column(String, nullable=False)
+    days_count = Column(Integer, nullable=False)
+    stall_total = Column(Float, nullable=False)
+    staff_total = Column(Float, nullable=False)
+    transport_outbound = Column(Float, nullable=False)
+    transport_return = Column(Float, nullable=False)
+    transport_total = Column(Float, nullable=False)
+    other_expenses = Column(Float, default=0.0)
+    debt_target = Column(Float, default=0.0)
+    profit_target = Column(Float, default=0.0)
+    capital_available = Column(Float, default=0.0)
+    manual_expected_sales = Column(Float, nullable=True)
+    config_id = Column(Integer, ForeignKey("fair_cost_configs.id"), nullable=True)
+    config_version = Column(Integer, nullable=True)  # None = valores por defecto
+    green_max_stock_pct = Column(Float, nullable=False)
+    yellow_max_stock_pct = Column(Float, nullable=False)
+    safety_margin_pct = Column(Float, nullable=False)
+    incomplete_data_tolerance_pct = Column(Float, nullable=False)
+    comparable_days_count = Column(Integer, nullable=False)
+    minimum_comparable_days = Column(Integer, nullable=False)
+    status = Column(String, default="BORRADOR", index=True)
+    notes = Column(Text, nullable=True)
+    created_by = Column(String, nullable=True)
+    updated_by = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class DayPlanSnapshotDB(Base):
+    __tablename__ = "day_plan_snapshots"
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey("day_plans.id"), nullable=False, index=True)
+    computed_at = Column(DateTime, default=datetime.datetime.utcnow)
+    calc_version = Column(Integer, nullable=False)
+    inputs_json = Column(Text, nullable=False)
+    results_json = Column(Text, nullable=False)
+    economic_verdict = Column(String, nullable=False)
+    commercial_verdict = Column(String, nullable=False)
+    computed_by = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -2742,3 +2813,565 @@ def get_system_alerts(branch_id: int = 1, db: Session = Depends(get_db)):
 
     order={"CRITICAL":0,"IMPORTANT":1,"INFO":2}
     return sorted(alerts,key=lambda x:order.get(x["level"],9))
+
+
+# =====================================================================
+# OBJETIVO DE JORNADA — FERIA ("¿Conviene abrir?")
+# El cálculo vive en fair_planning.py; acá solo se leen datos y se persiste.
+# =====================================================================
+
+FAIR_BRANCH_ID = 2
+DAY_PLAN_EDITABLE_STATUSES = ("BORRADOR", "PLANIFICADA")
+DAY_PLAN_STATUSES = ("BORRADOR", "PLANIFICADA", "ABIERTA", "CERRADA", "CANCELADA")
+FAIR_MONEY_CONFIG_FIELDS = ("stall_cost_per_day", "staff_cost_per_person_day", "transport_outbound", "transport_return")
+FAIR_PCT_CONFIG_FIELDS = ("green_max_stock_pct", "yellow_max_stock_pct", "safety_margin_pct", "incomplete_data_tolerance_pct")
+
+class FairConfigUpdateSchema(BaseModel):
+    stall_cost_per_day: Optional[float] = None
+    staff_count: Optional[int] = None
+    staff_cost_per_person_day: Optional[float] = None
+    transport_outbound: Optional[float] = None
+    transport_return: Optional[float] = None
+    green_max_stock_pct: Optional[float] = None
+    yellow_max_stock_pct: Optional[float] = None
+    safety_margin_pct: Optional[float] = None
+    incomplete_data_tolerance_pct: Optional[float] = None
+    comparable_days_count: Optional[int] = None
+    minimum_comparable_days: Optional[int] = None
+    updated_by: Optional[str] = None
+    notes: Optional[str] = None
+
+class DayPlanInputSchema(BaseModel):
+    branch_id: int = FAIR_BRANCH_ID
+    plan_type: str
+    start_date: str
+    end_date: Optional[str] = None
+    days_count: Optional[int] = None
+    stall_total: Optional[float] = None
+    staff_total: Optional[float] = None
+    transport_outbound: Optional[float] = None
+    transport_return: Optional[float] = None
+    other_expenses: float = 0.0
+    debt_target: float = 0.0
+    profit_target: float = 0.0
+    capital_available: float = 0.0
+    manual_expected_sales: Optional[float] = None
+    status: Optional[str] = "BORRADOR"
+    notes: Optional[str] = None
+    created_by: Optional[str] = None
+
+class DayPlanUpdateSchema(BaseModel):
+    plan_type: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    days_count: Optional[int] = None
+    stall_total: Optional[float] = None
+    staff_total: Optional[float] = None
+    transport_outbound: Optional[float] = None
+    transport_return: Optional[float] = None
+    other_expenses: Optional[float] = None
+    debt_target: Optional[float] = None
+    profit_target: Optional[float] = None
+    capital_available: Optional[float] = None
+    manual_expected_sales: Optional[float] = None
+    clear_manual_expected_sales: bool = False
+    notes: Optional[str] = None
+    updated_by: Optional[str] = None
+
+class DayPlanRecalculateSchema(BaseModel):
+    actor: Optional[str] = None
+
+class DayPlanStatusSchema(BaseModel):
+    status: str
+    actor: Optional[str] = None
+    reason: Optional[str] = None
+
+
+def _schema_dump(model: BaseModel) -> dict:
+    # Compatible con Pydantic v1 y v2.
+    return model.model_dump() if hasattr(model, "model_dump") else model.dict()
+
+
+def _require_fair_branch(branch_id: int, db: Session):
+    if branch_id != FAIR_BRANCH_ID:
+        raise HTTPException(status_code=422, detail="El Objetivo de Jornada solo está disponible para Feria Damyale (branch_id=2).")
+    branch = db.query(BranchDB).filter(BranchDB.id == branch_id, BranchDB.is_active == True).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Sucursal no encontrada")
+
+
+def _fair_config_row(db: Session, branch_id: int):
+    return db.query(FairCostConfigDB).filter(
+        FairCostConfigDB.branch_id == branch_id, FairCostConfigDB.is_current == True
+    ).order_by(FairCostConfigDB.version.desc()).first()
+
+
+def _fair_config_values(row) -> dict:
+    if row is None:
+        values = dict(fair_planning.DEFAULT_FAIR_CONFIG)
+        values.update({"version": None, "source": "default", "config_id": None})
+        return values
+    values = {k: getattr(row, k) for k in fair_planning.DEFAULT_FAIR_CONFIG}
+    for k in FAIR_MONEY_CONFIG_FIELDS + FAIR_PCT_CONFIG_FIELDS:
+        values[k] = D(values[k])
+    values.update({"version": row.version, "source": "saved", "config_id": row.id})
+    return values
+
+
+def _fair_config_out(branch_id: int, values: dict, row=None) -> dict:
+    out = {"branch_id": branch_id, "version": values["version"], "source": values["source"]}
+    for k in fair_planning.DEFAULT_FAIR_CONFIG:
+        v = values[k]
+        out[k] = float(v) if isinstance(v, fair_planning.Decimal) else v
+    weekend = fair_planning.operating_costs({
+        "stall_total": D(values["stall_cost_per_day"]) * 2,
+        "staff_total": D(values["staff_cost_per_person_day"]) * values["staff_count"] * 2,
+        "transport_outbound": values["transport_outbound"], "transport_return": values["transport_return"],
+    })
+    out["weekend_operating_cost"] = fair_planning.money(weekend["opex"])
+    out["created_at"] = row.created_at.isoformat() if row is not None and row.created_at else None
+    out["created_by"] = row.created_by if row is not None else None
+    return out
+
+
+def _validate_fair_config(values: dict):
+    for k in FAIR_MONEY_CONFIG_FIELDS:
+        v = D(values[k])
+        if not v.is_finite() or v < 0:
+            raise HTTPException(status_code=422, detail=f"{k} debe ser un importe mayor o igual a 0")
+    if not isinstance(values["staff_count"], int) or not 0 <= values["staff_count"] <= 100:
+        raise HTTPException(status_code=422, detail="staff_count debe ser un entero entre 0 y 100")
+    for k in FAIR_PCT_CONFIG_FIELDS:
+        v = D(values[k])
+        if not v.is_finite() or v < 0 or v > 1:
+            raise HTTPException(status_code=422, detail=f"{k} debe estar entre 0 y 1")
+    if D(values["green_max_stock_pct"]) <= 0:
+        raise HTTPException(status_code=422, detail="green_max_stock_pct debe ser mayor a 0")
+    if D(values["green_max_stock_pct"]) > D(values["yellow_max_stock_pct"]):
+        raise HTTPException(status_code=422, detail="green_max_stock_pct no puede superar yellow_max_stock_pct")
+    if not isinstance(values["comparable_days_count"], int) or not 1 <= values["comparable_days_count"] <= 52:
+        raise HTTPException(status_code=422, detail="comparable_days_count debe estar entre 1 y 52")
+    if not isinstance(values["minimum_comparable_days"], int) or not 1 <= values["minimum_comparable_days"] <= values["comparable_days_count"]:
+        raise HTTPException(status_code=422, detail="minimum_comparable_days debe estar entre 1 y comparable_days_count")
+
+
+@app.get("/branches/{branch_id}/fair-config")
+def get_fair_config(branch_id: int, db: Session = Depends(get_db)):
+    _require_fair_branch(branch_id, db)
+    row = _fair_config_row(db, branch_id)
+    return _fair_config_out(branch_id, _fair_config_values(row), row)
+
+
+@app.put("/branches/{branch_id}/fair-config")
+def update_fair_config(branch_id: int, payload: FairConfigUpdateSchema, db: Session = Depends(get_db)):
+    _require_fair_branch(branch_id, db)
+    current = _fair_config_values(_fair_config_row(db, branch_id))
+    values = {k: current[k] for k in fair_planning.DEFAULT_FAIR_CONFIG}
+    for k in fair_planning.DEFAULT_FAIR_CONFIG:
+        v = getattr(payload, k)
+        if v is not None:
+            values[k] = v
+    _validate_fair_config(values)
+    last_version = db.query(func.max(FairCostConfigDB.version)).filter(FairCostConfigDB.branch_id == branch_id).scalar() or 0
+    # Versionado: la configuración anterior queda guardada; los planes conservan su copia.
+    db.query(FairCostConfigDB).filter(FairCostConfigDB.branch_id == branch_id, FairCostConfigDB.is_current == True).update({"is_current": False})
+    row = FairCostConfigDB(
+        branch_id=branch_id, version=last_version + 1, is_current=True,
+        created_by=payload.updated_by, notes=payload.notes,
+        **{k: (float(D(values[k])) if k in FAIR_MONEY_CONFIG_FIELDS + FAIR_PCT_CONFIG_FIELDS else values[k])
+           for k in fair_planning.DEFAULT_FAIR_CONFIG}
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _fair_config_out(branch_id, _fair_config_values(row), row)
+
+
+def _parse_plan_date(value: Optional[str], field: str) -> Optional[datetime.date]:
+    if value is None or not str(value).strip():
+        return None
+    raw = str(value).strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(raw, fmt).date()
+        except ValueError:
+            pass
+    raise HTTPException(status_code=422, detail=f"{field} inválida. Usá DD/MM/AAAA.")
+
+
+def _money_input(value, field: str, required: bool = False):
+    if value is None:
+        if required:
+            raise HTTPException(status_code=422, detail=f"{field} es obligatorio")
+        return None
+    v = D(value)
+    if not v.is_finite() or v < 0:
+        raise HTTPException(status_code=422, detail=f"{field} debe ser un importe mayor o igual a 0")
+    return v
+
+
+def _config_for_plan(db: Session, plan) -> dict:
+    """Configuración con la que se creó el plan (nunca la actual)."""
+    row = db.query(FairCostConfigDB).filter(FairCostConfigDB.id == plan.config_id).first() if plan.config_id else None
+    return _fair_config_values(row)
+
+
+def _resolve_plan_inputs(data: dict, config: dict) -> dict:
+    """Normaliza y valida las entradas de un plan. data contiene valores ya existentes o nuevos."""
+    plan_type = str(data.get("plan_type") or "").strip().upper()
+    if plan_type not in fair_planning.PLAN_TYPES:
+        raise HTTPException(status_code=422, detail=f"plan_type inválido. Opciones: {', '.join(fair_planning.PLAN_TYPES)}")
+    start = _parse_plan_date(data.get("start_date"), "start_date")
+    if start is None:
+        raise HTTPException(status_code=422, detail="start_date es obligatoria")
+    end = _parse_plan_date(data.get("end_date"), "end_date")
+
+    if plan_type == "SABADO":
+        if start.weekday() != 5:
+            raise HTTPException(status_code=422, detail="Para SABADO la fecha debe ser un sábado")
+        end, days = start, 1
+    elif plan_type == "DOMINGO":
+        if start.weekday() != 6:
+            raise HTTPException(status_code=422, detail="Para DOMINGO la fecha debe ser un domingo")
+        end, days = start, 1
+    elif plan_type == "FIN_DE_SEMANA":
+        if start.weekday() != 5:
+            raise HTTPException(status_code=422, detail="FIN_DE_SEMANA debe comenzar un sábado")
+        expected_end = start + datetime.timedelta(days=1)
+        if end is not None and end != expected_end:
+            raise HTTPException(status_code=422, detail="FIN_DE_SEMANA debe terminar el domingo siguiente")
+        end, days = expected_end, 2
+    elif plan_type in ("FERIADO", "EXTRAORDINARIA"):
+        if end is not None and end != start:
+            raise HTTPException(status_code=422, detail=f"{plan_type} es de un día; para varios días usá PERSONALIZADA")
+        end, days = start, 1
+    else:  # PERSONALIZADA
+        if end is None:
+            raise HTTPException(status_code=422, detail="PERSONALIZADA requiere end_date")
+        if end < start:
+            raise HTTPException(status_code=422, detail="end_date no puede ser anterior a start_date")
+        span = (end - start).days + 1
+        if span > 31:
+            raise HTTPException(status_code=422, detail="Una jornada PERSONALIZADA no puede superar 31 días")
+        days = data.get("days_count") or span
+        if not isinstance(days, int) or not 1 <= days <= span:
+            raise HTTPException(status_code=422, detail="days_count debe estar entre 1 y la cantidad de días del rango")
+
+    stall = _money_input(data.get("stall_total"), "stall_total")
+    staff = _money_input(data.get("staff_total"), "staff_total")
+    if stall is None:
+        stall = D(config["stall_cost_per_day"]) * days
+    if staff is None:
+        staff = D(config["staff_cost_per_person_day"]) * config["staff_count"] * days
+
+    t_out = _money_input(data.get("transport_outbound"), "transport_outbound")
+    t_ret = _money_input(data.get("transport_return"), "transport_return")
+    if plan_type == "FIN_DE_SEMANA":
+        t_out = D(config["transport_outbound"]) if t_out is None else t_out
+        t_ret = D(config["transport_return"]) if t_ret is None else t_ret
+    elif t_out is None or t_ret is None:
+        # Para jornadas individuales el transporte se define al crear el plan (puede ser 0).
+        raise HTTPException(status_code=422, detail="Indicá transport_outbound y transport_return para este tipo de jornada (pueden ser 0).")
+
+    manual = _money_input(data.get("manual_expected_sales"), "manual_expected_sales")
+    return {
+        "plan_type": plan_type, "start_date": start, "end_date": end, "days_count": days,
+        "stall_total": stall, "staff_total": staff,
+        "transport_outbound": t_out, "transport_return": t_ret, "transport_total": t_out + t_ret,
+        "other_expenses": _money_input(data.get("other_expenses") or 0, "other_expenses"),
+        "debt_target": _money_input(data.get("debt_target") or 0, "debt_target"),
+        "profit_target": _money_input(data.get("profit_target") or 0, "profit_target"),
+        "capital_available": _money_input(data.get("capital_available") or 0, "capital_available"),
+        "manual_expected_sales": manual,
+    }
+
+
+def _thresholds_from(source) -> dict:
+    if isinstance(source, dict):
+        return {k: source[k] for k in fair_planning.THRESHOLD_KEYS}
+    return {k: getattr(source, k) for k in fair_planning.THRESHOLD_KEYS}
+
+
+def _load_fair_data(db: Session, branch_id: int, before: datetime.date, comparable_days_count: int) -> dict:
+    """Lee stock (lotes de la sucursal), precios de Feria, historial y costos de reposición."""
+    lot_rows = db.query(ProductLotDB).filter(ProductLotDB.branch_id == branch_id, ProductLotDB.current_qty > 0).all()
+    lots = [{"lot_id": l.id, "product_id": l.product_id, "qty": l.current_qty, "cost_price": l.cost_price} for l in lot_rows]
+    product_ids = sorted({l["product_id"] for l in lots})
+    products = {}
+    if product_ids:
+        prods = {p.id: p for p in db.query(ProductDB).filter(ProductDB.id.in_(product_ids)).all()}
+        configs = {c.product_id: c for c in db.query(BranchProductDB).filter(
+            BranchProductDB.branch_id == branch_id, BranchProductDB.product_id.in_(product_ids)).all()}
+        for pid in product_ids:
+            p, c = prods.get(pid), configs.get(pid)
+            products[pid] = {
+                "name": p.name if p else None, "unit_type": p.unit_type if p else None,
+                "product_active": bool(p and p.is_active),
+                "branch_available": bool(c and c.is_available),
+                "branch_price": c.price_per_unit if c is not None else None,
+                "base_price": p.price_per_unit if p else None,
+            }
+
+    cutoff_utc = ar_to_utc(datetime.datetime(before.year, before.month, before.day))
+    sales = db.query(SaleDB).filter(SaleDB.branch_id == branch_id, SaleDB.created_at < cutoff_utc).all()
+    daily = {}
+    item_revenue_by_day = {}
+    for sale in sales:
+        day = utc_to_ar(sale.created_at).date()
+        d = daily.setdefault(day, {"date": day, "revenue": D(0), "gross_profit": D(0)})
+        d["revenue"] += D(sale.total_amount)
+        per_day = item_revenue_by_day.setdefault(day, {})
+        for item in sale.items:
+            d["gross_profit"] += D(item.gross_profit)
+            per_day[item.product_id] = per_day.get(item.product_id, D(0)) + D(item.unit_price) * D(item.quantity)
+    mix_days = sorted(item_revenue_by_day, reverse=True)[:comparable_days_count]
+    product_revenue = {}
+    for day in mix_days:
+        for pid, rev in item_revenue_by_day[day].items():
+            product_revenue[pid] = product_revenue.get(pid, D(0)) + rev
+
+    replacement_costs = {}
+    if product_ids:
+        ingresses = db.query(ProductIngressDB).filter(
+            ProductIngressDB.branch_id == branch_id, ProductIngressDB.product_id.in_(product_ids),
+            ProductIngressDB.cost_price > 0, ProductIngressDB.quantity > 0
+        ).order_by(ProductIngressDB.received_at.desc(), ProductIngressDB.id.desc()).all()
+        for ing in ingresses:
+            replacement_costs.setdefault(ing.product_id, D(ing.cost_price))
+
+    return {"lots": lots, "products": products, "daily_sales": list(daily.values()),
+            "product_revenue": product_revenue, "history_days_count": len(mix_days),
+            "replacement_costs": replacement_costs}
+
+
+def _plan_calc_dict(resolved: dict) -> dict:
+    return {k: (v.isoformat() if isinstance(v, datetime.date) else v) for k, v in resolved.items()}
+
+
+def _compute_for(db: Session, branch_id: int, resolved: dict, thresholds: dict):
+    data = _load_fair_data(db, branch_id, resolved["start_date"], int(thresholds["comparable_days_count"]))
+    result = fair_planning.compute_day_plan(
+        _plan_calc_dict(resolved), thresholds, data["lots"], data["products"], data["daily_sales"],
+        data["product_revenue"], data["history_days_count"], data["replacement_costs"])
+    inputs = {
+        "branch_id": branch_id,
+        "plan": {k: (float(v) if isinstance(v, fair_planning.Decimal) else v) for k, v in _plan_calc_dict(resolved).items()},
+        "thresholds": {k: (float(v) if isinstance(v, fair_planning.Decimal) else v) for k, v in thresholds.items()},
+        "data_sources": {
+            "lots_considered": len(data["lots"]),
+            "history_sale_days": len(data["daily_sales"]),
+            "mix_history_days": data["history_days_count"],
+            "replacement_costs": {str(k): float(v) for k, v in data["replacement_costs"].items()},
+            "history_cutoff_ar_date": resolved["start_date"].isoformat(),
+        },
+    }
+    return inputs, result
+
+
+def _fmt_ddmmyyyy(iso: Optional[str]) -> Optional[str]:
+    if not iso:
+        return None
+    return datetime.date.fromisoformat(iso).strftime("%d/%m/%Y")
+
+
+def _plan_out(plan) -> dict:
+    out = {c.name: getattr(plan, c.name) for c in DayPlanDB.__table__.columns}
+    out["start_date_display"] = _fmt_ddmmyyyy(plan.start_date)
+    out["end_date_display"] = _fmt_ddmmyyyy(plan.end_date)
+    for k in ("created_at", "updated_at"):
+        out[k] = out[k].isoformat() if out[k] else None
+    out["operating_cost_total"] = fair_planning.money(
+        D(plan.stall_total) + D(plan.staff_total) + D(plan.transport_total) + D(plan.other_expenses))
+    return out
+
+
+def _snapshot_summary(s) -> dict:
+    return {"id": s.id, "computed_at": s.computed_at.isoformat() if s.computed_at else None,
+            "calc_version": s.calc_version, "economic_verdict": s.economic_verdict,
+            "commercial_verdict": s.commercial_verdict, "computed_by": s.computed_by}
+
+
+def _save_snapshot(db: Session, plan, inputs: dict, result: dict, actor: Optional[str]):
+    snap = DayPlanSnapshotDB(
+        plan_id=plan.id, calc_version=fair_planning.CALC_VERSION,
+        inputs_json=json.dumps(inputs, ensure_ascii=False), results_json=json.dumps(result, ensure_ascii=False),
+        economic_verdict=result["economic"]["verdict"], commercial_verdict=result["commercial"]["verdict"],
+        computed_by=actor)
+    db.add(snap)
+    return snap
+
+
+def _apply_resolved(plan, resolved: dict):
+    for k, v in resolved.items():
+        if isinstance(v, datetime.date):
+            v = v.isoformat()
+        elif isinstance(v, fair_planning.Decimal):
+            v = float(v)
+        setattr(plan, k, v)
+
+
+def _get_plan_or_404(db: Session, plan_id: int):
+    plan = db.query(DayPlanDB).filter(DayPlanDB.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan de jornada no encontrado")
+    return plan
+
+
+def _plan_detail(db: Session, plan) -> dict:
+    snaps = db.query(DayPlanSnapshotDB).filter(DayPlanSnapshotDB.plan_id == plan.id).order_by(DayPlanSnapshotDB.id.desc()).all()
+    latest = snaps[0] if snaps else None
+    return {
+        "plan": _plan_out(plan),
+        "latest_snapshot": ({**_snapshot_summary(latest), "results": json.loads(latest.results_json),
+                             "inputs": json.loads(latest.inputs_json)} if latest else None),
+        "snapshots": [_snapshot_summary(s) for s in snaps],
+    }
+
+
+@app.post("/day-plans/preview")
+def preview_day_plan(payload: DayPlanInputSchema, db: Session = Depends(get_db)):
+    _require_fair_branch(payload.branch_id, db)
+    config = _fair_config_values(_fair_config_row(db, payload.branch_id))
+    resolved = _resolve_plan_inputs(_schema_dump(payload), config)
+    thresholds = _thresholds_from(config)
+    inputs, result = _compute_for(db, payload.branch_id, resolved, thresholds)
+    # Preview no persiste nada.
+    return {"persisted": False, "config_version": config["version"], "inputs": inputs, "results": result}
+
+
+@app.post("/day-plans")
+def create_day_plan(payload: DayPlanInputSchema, db: Session = Depends(get_db)):
+    _require_fair_branch(payload.branch_id, db)
+    status_value = (payload.status or "BORRADOR").strip().upper()
+    if status_value not in DAY_PLAN_EDITABLE_STATUSES:
+        raise HTTPException(status_code=422, detail="Un plan nuevo solo puede crearse como BORRADOR o PLANIFICADA")
+    config = _fair_config_values(_fair_config_row(db, payload.branch_id))
+    resolved = _resolve_plan_inputs(_schema_dump(payload), config)
+    thresholds = _thresholds_from(config)
+    inputs, result = _compute_for(db, payload.branch_id, resolved, thresholds)
+
+    now = datetime.datetime.utcnow()
+    plan = DayPlanDB(branch_id=payload.branch_id, status=status_value, notes=payload.notes,
+                     created_by=payload.created_by, updated_by=payload.created_by,
+                     config_id=config["config_id"], config_version=config["version"],
+                     created_at=now, updated_at=now,
+                     **{k: (float(v) if isinstance(v, fair_planning.Decimal) else v) for k, v in thresholds.items()})
+    _apply_resolved(plan, resolved)
+    db.add(plan)
+    db.flush()
+    _save_snapshot(db, plan, inputs, result, payload.created_by)
+    db.commit()
+    db.refresh(plan)
+    return _plan_detail(db, plan)
+
+
+@app.get("/day-plans")
+def list_day_plans(branch_id: int = FAIR_BRANCH_ID, status: Optional[str] = None, db: Session = Depends(get_db)):
+    _require_fair_branch(branch_id, db)
+    q = db.query(DayPlanDB).filter(DayPlanDB.branch_id == branch_id)
+    if status:
+        q = q.filter(DayPlanDB.status == status.strip().upper())
+    plans = q.order_by(DayPlanDB.start_date.desc(), DayPlanDB.id.desc()).all()
+    result = []
+    for plan in plans:
+        latest = db.query(DayPlanSnapshotDB).filter(DayPlanSnapshotDB.plan_id == plan.id).order_by(DayPlanSnapshotDB.id.desc()).first()
+        item = _plan_out(plan)
+        item["latest_snapshot"] = _snapshot_summary(latest) if latest else None
+        if latest:
+            item["latest_snapshot"]["headline"] = json.loads(latest.results_json).get("headline")
+        result.append(item)
+    return result
+
+
+@app.get("/day-plans/{plan_id}")
+def get_day_plan(plan_id: int, db: Session = Depends(get_db)):
+    return _plan_detail(db, _get_plan_or_404(db, plan_id))
+
+
+@app.put("/day-plans/{plan_id}")
+def update_day_plan(plan_id: int, payload: DayPlanUpdateSchema, db: Session = Depends(get_db)):
+    plan = _get_plan_or_404(db, plan_id)
+    if plan.status not in DAY_PLAN_EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"No se puede editar un plan en estado {plan.status}")
+    changes = {k: v for k, v in _schema_dump(payload).items()
+               if v is not None and k not in ("updated_by", "notes", "clear_manual_expected_sales")}
+    new_type = (changes.get("plan_type") or plan.plan_type).strip().upper()
+    type_changed = new_type != plan.plan_type
+    dates_changed = any(k in changes for k in ("start_date", "end_date", "days_count")) or type_changed
+
+    data = {
+        "plan_type": plan.plan_type, "start_date": plan.start_date, "end_date": plan.end_date,
+        "days_count": plan.days_count,
+        # Si cambian tipo/fechas y no se informan, puesto y personal se recalculan con la config ORIGINAL del plan.
+        "stall_total": None if dates_changed else plan.stall_total,
+        "staff_total": None if dates_changed else plan.staff_total,
+        # Si cambia el tipo de jornada, el transporte no se arrastra en silencio.
+        "transport_outbound": None if type_changed else plan.transport_outbound,
+        "transport_return": None if type_changed else plan.transport_return,
+        "other_expenses": plan.other_expenses, "debt_target": plan.debt_target,
+        "profit_target": plan.profit_target, "capital_available": plan.capital_available,
+        "manual_expected_sales": None if payload.clear_manual_expected_sales else plan.manual_expected_sales,
+    }
+    if "start_date" in changes and "end_date" not in changes:
+        data["end_date"] = None
+    if dates_changed and "days_count" not in changes:
+        data["days_count"] = None
+    data.update(changes)
+
+    config = _config_for_plan(db, plan)
+    resolved = _resolve_plan_inputs(data, config)
+    thresholds = _thresholds_from(plan)
+    inputs, result = _compute_for(db, plan.branch_id, resolved, thresholds)
+    _apply_resolved(plan, resolved)
+    if payload.notes is not None:
+        plan.notes = payload.notes
+    plan.updated_by = payload.updated_by
+    plan.updated_at = datetime.datetime.utcnow()
+    _save_snapshot(db, plan, inputs, result, payload.updated_by)
+    db.commit()
+    db.refresh(plan)
+    return _plan_detail(db, plan)
+
+
+@app.post("/day-plans/{plan_id}/recalculate")
+def recalculate_day_plan(plan_id: int, payload: Optional[DayPlanRecalculateSchema] = None, db: Session = Depends(get_db)):
+    plan = _get_plan_or_404(db, plan_id)
+    if plan.status not in DAY_PLAN_EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"No se puede recalcular un plan en estado {plan.status}")
+    resolved = _resolve_plan_inputs({
+        "plan_type": plan.plan_type, "start_date": plan.start_date, "end_date": plan.end_date,
+        "days_count": plan.days_count, "stall_total": plan.stall_total, "staff_total": plan.staff_total,
+        "transport_outbound": plan.transport_outbound, "transport_return": plan.transport_return,
+        "other_expenses": plan.other_expenses, "debt_target": plan.debt_target,
+        "profit_target": plan.profit_target, "capital_available": plan.capital_available,
+        "manual_expected_sales": plan.manual_expected_sales,
+    }, _config_for_plan(db, plan))
+    inputs, result = _compute_for(db, plan.branch_id, resolved, _thresholds_from(plan))
+    _save_snapshot(db, plan, inputs, result, payload.actor if payload else None)
+    db.commit()
+    return _plan_detail(db, plan)
+
+
+@app.patch("/day-plans/{plan_id}/status")
+def change_day_plan_status(plan_id: int, payload: DayPlanStatusSchema, db: Session = Depends(get_db)):
+    plan = _get_plan_or_404(db, plan_id)
+    new_status = payload.status.strip().upper()
+    if new_status not in DAY_PLAN_STATUSES:
+        raise HTTPException(status_code=422, detail=f"Estado inválido. Opciones: {', '.join(DAY_PLAN_STATUSES)}")
+    if new_status in ("ABIERTA", "CERRADA"):
+        raise HTTPException(status_code=422, detail="Abrir/cerrar jornadas se habilita en la etapa Jornada en vivo")
+    if plan.status not in DAY_PLAN_EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"No se puede cambiar el estado de un plan {plan.status}")
+    if new_status == plan.status:
+        return _plan_detail(db, plan)
+    if new_status == "CANCELADA":
+        # Baja lógica: el plan y sus cálculos quedan guardados.
+        stamp = ar_now().strftime("%d/%m/%Y %H:%M")
+        note = f"[CANCELADA {stamp}{' por ' + payload.actor if payload.actor else ''}{': ' + payload.reason if payload.reason else ''}]"
+        plan.notes = f"{plan.notes}\n{note}" if plan.notes else note
+    plan.status = new_status
+    plan.updated_by = payload.actor
+    plan.updated_at = datetime.datetime.utcnow()
+    db.commit()
+    db.refresh(plan)
+    return _plan_detail(db, plan)

@@ -63,14 +63,16 @@ Resultado operativo real:
   - costo de mercadería vendida (sale_items.cogs: costo histórico FEFO de la venta)
   = margen bruto
   - costos operativos planificados (puesto + personal + transporte + otros del plan, congelados)
-  - gastos extraordinarios reales (cash_movements OUT: OPERATIVO, SERVICIOS, COMPRA_MENOR, OTRO;
-    una categoría desconocida también se cuenta y se advierte)
+  - gastos extraordinarios reales (cash_movements OUT: OPERATIVO, SERVICIOS, SERVICIO, COMPRA_MENOR,
+    OTRO, CAJA_CHICA; SERVICIO y CAJA_CHICA son alias históricos)
   - mermas reales a costo (stock_movements LOSS: |cantidad| x unit_cost histórico)
   = resultado operativo real
 
 EMPLEADO se muestra solo como informativo (el personal ya está en el plan); PROVEEDOR
-(mercadería, ya entra por COGS) y RETIRO_DUENO se excluyen. Deuda y ganancia deseada son
-objetivos: nunca se restan como gasto.
+(mercadería, ya entra por COGS) y RETIRO_DUENO se excluyen. Una categoría desconocida **no
+se resta**: queda listada como movimiento no clasificado, con su monto y la advertencia
+`CATEGORIA_GASTO_NO_RECONOCIDA`, sin modificar el resultado hasta que exista una regla explícita.
+Deuda y ganancia deseada son objetivos: nunca se restan como gasto.
 
 Esquema (`ensure_fair_live_schema`, idempotente, sin borrar ni recrear tablas):
 columnas `opened_at`, `opened_by`, `closed_at`, `closed_by`, `final_results_json`,

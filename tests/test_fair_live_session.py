@@ -541,14 +541,74 @@ def test_pure_live_calc_without_sales():
     json.dumps(out)   # serializable para el snapshot final
 
 
-def test_pure_unknown_cash_category_counts_as_expense():
+def test_pure_cash_categories_classification():
     plan = {"stall_total": 0, "staff_total": 0, "transport_outbound": 0, "transport_return": 0,
             "end_date": "2026-10-17"}
     day = datetime.date(2026, 10, 17)
-    out = fair_planning.compute_live_session(
-        plan, [], [{"date": day, "movement_type": "OUT", "category": "raro", "amount": 50}], [], day, day, None)
+    restan = ("OPERATIVO", "SERVICIOS", "SERVICIO", "COMPRA_MENOR", "OTRO", "CAJA_CHICA", "operativo")
+    no_restan = ("PROVEEDOR", "RETIRO_DUENO", "EMPLEADO")
+    movs = [{"date": day, "movement_type": "OUT", "category": c, "amount": 100} for c in restan + no_restan]
+    out = fair_planning.compute_live_session(plan, [], movs, [], day, day, None)
+    assert out["result"]["extra_expenses"] == 700
+    assert out["result"]["operating_result"] == -700
+    acc = out["accumulated"]
+    assert acc["employee_payments_info"] == 100
+    assert acc["supplier_payments_excluded"] == 100 and acc["owner_withdrawals_excluded"] == 100
+    assert acc["unclassified_expenses"] == 0 and out["data_quality"]["unclassified_cash_movements"] == []
+    assert "CATEGORIA_GASTO_NO_RECONOCIDA" not in {w["code"] for w in out["warnings"]}
+
+
+def test_pure_unknown_cash_category_is_not_subtracted():
+    plan = {"stall_total": 1000, "staff_total": 0, "transport_outbound": 0, "transport_return": 0,
+            "end_date": "2026-10-17"}
+    day = datetime.date(2026, 10, 17)
+    movs = [{"date": day, "movement_type": "OUT", "category": "PUBLICIDAD", "amount": 1234.5},
+            {"date": day, "movement_type": "OUT", "category": None, "amount": 100},
+            {"date": day, "movement_type": "OUT", "category": "OPERATIVO", "amount": 50},
+            {"date": day, "movement_type": "IN", "category": "PUBLICIDAD", "amount": 999}]  # ingresos: ignorados
+    out = fair_planning.compute_live_session(plan, [], movs, [], day, day, day)
+    # El resultado no cambia por la categoría desconocida: solo resta OPERATIVO.
     assert out["result"]["extra_expenses"] == 50
-    assert "CATEGORIA_GASTO_NO_RECONOCIDA" in {w["code"] for w in out["warnings"]}
+    assert out["result"]["operating_result"] == -1050
+    assert out["objectives"]["equilibrium"]["required_margin"] == 1050
+    # Visible como no clasificado, con monto y advertencia de calidad de datos.
+    assert out["accumulated"]["unclassified_expenses"] == 1334.5
+    assert out["accumulated"]["unclassified_count"] == 2
+    assert out["today"]["unclassified_expenses"] == 1334.5
+    dq = out["data_quality"]
+    assert dq["complete"] is False and dq["unclassified_expenses"] == 1334.5
+    assert dq["unclassified_cash_movements"] == [
+        {"date": "2026-10-17", "category": "PUBLICIDAD", "amount": 1234.5},
+        {"date": "2026-10-17", "category": None, "amount": 100.0}]
+    w = [w for w in out["warnings"] if w["code"] == "CATEGORIA_GASTO_NO_RECONOCIDA"][0]
+    assert w["amount"] == 1334.5
+    assert "$1.334,50" in w["detail"] and "PUBLICIDAD" in w["detail"] and "NO se restaron" in w["detail"]
+
+
+def test_unknown_category_via_api_does_not_change_result(clock):
+    pid = create_plan()   # opex 500000
+    open_plan(pid)
+    t = SAT_OPEN + datetime.timedelta(hours=1)
+    add_sale(800000, 400000, t)
+    add_cash("SERVICIO", 1000, t)       # alias histórico: resta
+    add_cash("CAJA_CHICA", 2000, t)     # alias histórico: resta
+    clock["now"] = SAT_LATER
+    before = live(pid)["result"]
+    assert before["extra_expenses"] == 3000 and before["operating_result"] == -103000
+    add_cash("NUEVA_CATEGORIA", 50000, t)
+    data = live(pid)
+    assert data["result"] == before
+    assert data["accumulated"]["unclassified_expenses"] == 50000
+    assert "CATEGORIA_GASTO_NO_RECONOCIDA" in {w["code"] for w in data["warnings"]}
+    final = close_plan(pid).json()
+    assert final["result"] == before
+    assert final["data_quality"]["unclassified_cash_movements"][0]["category"] == "NUEVA_CATEGORIA"
+
+
+def test_ar_money_format():
+    assert fair_planning.ar_money(Decimal("1334.5")) == "$1.334,50"
+    assert fair_planning.ar_money(0) == "$0,00"
+    assert fair_planning.ar_money(-1234567.891) == "-$1.234.567,89"
 
 
 # ---------- Base SQLite existente ----------

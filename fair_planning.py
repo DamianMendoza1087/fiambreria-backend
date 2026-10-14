@@ -664,16 +664,17 @@ def compute_day_plan(plan: dict, thresholds: dict, lots: List[dict], products: D
 #   - costo de mercadería vendida (sale_items.cogs, histórico FEFO)
 #   = margen bruto
 #   - costos operativos planificados (puesto + personal + transporte + otros del plan)
-#   - gastos extraordinarios reales (caja: OPERATIVO, SERVICIOS, COMPRA_MENOR, OTRO)
+#   - gastos extraordinarios reales (caja: OPERATIVO, SERVICIOS/SERVICIO, COMPRA_MENOR, OTRO, CAJA_CHICA)
 #   - mermas reales a costo (stock_movements LOSS: |cantidad| x costo histórico)
 #
 # Deuda y ganancia deseada son OBJETIVOS: nunca se restan como gasto.
 
 LIVE_CALC_VERSION = 1
 
-# Categorías de caja (las mismas variantes que reconoce el KPI de rentabilidad).
-CASH_EXTRA_EXPENSE_CATEGORIES = {"OPERATIVO", "OPERATIVOS", "GASTO_OPERATIVO", "SERVICIO", "SERVICIOS",
-                                 "COMPRA_MENOR", "CAJA_CHICA", "OTRO", "OTROS"}
+# Categorías de caja. Solo estas restan como gasto extraordinario (SERVICIO y CAJA_CHICA son
+# alias históricos). Cualquier otra categoría de salida que no figure en estos conjuntos queda
+# "no clasificada": se informa con su monto, pero no modifica el resultado hasta tener una regla.
+CASH_EXTRA_EXPENSE_CATEGORIES = {"OPERATIVO", "SERVICIOS", "SERVICIO", "COMPRA_MENOR", "OTRO", "CAJA_CHICA"}
 CASH_EMPLOYEE_CATEGORIES = {"EMPLEADO", "EMPLEADOS", "PAGO_EMPLEADO", "SUELDO", "SUELDOS", "SALARIO"}
 CASH_SUPPLIER_CATEGORIES = {"PROVEEDOR", "PROVEEDORES", "PAGO_PROVEEDOR", "MERCADERIA", "COMPRA_MERCADERIA"}
 CASH_OWNER_CATEGORIES = {"RETIRO_DUENO", "RETIRO_DUEÑO", "OWNER_WITHDRAWAL"}
@@ -688,6 +689,14 @@ LIVE_INDICATOR_LABELS = {
 }
 
 
+def ar_money(value) -> str:
+    """Importe con formato argentino para textos de advertencia: $1.234,56."""
+    q = D(value).quantize(CENT, rounding=ROUND_HALF_UP)
+    sign = "-" if q < 0 else ""
+    integer, cents = f"{abs(q):.2f}".split(".")
+    return f"{sign}${int(integer):,}".replace(",", ".") + f",{cents}"
+
+
 def cash_category_bucket(category: Optional[str]) -> str:
     c = (category or "").strip().upper()
     if c in CASH_EXTRA_EXPENSE_CATEGORIES:
@@ -698,13 +707,13 @@ def cash_category_bucket(category: Optional[str]) -> str:
         return "supplier"
     if c in CASH_OWNER_CATEGORIES:
         return "owner"
-    # Categoría desconocida: se cuenta como gasto real (no se esconde) y se advierte.
-    return "unknown"
+    # Categoría desconocida: no se asume gasto operativo (podría falsear la rentabilidad).
+    return "unclassified"
 
 
 def _empty_bucket() -> dict:
     return {"sales_count": 0, "revenue": ZERO, "cogs": ZERO, "promo_sales_count": 0, "promo_revenue": ZERO,
-            "extra_expenses": ZERO, "unknown_category_expenses": ZERO, "employee_payments": ZERO,
+            "extra_expenses": ZERO, "unclassified_expenses": ZERO, "unclassified_count": 0, "employee_payments": ZERO,
             "supplier_payments": ZERO, "owner_withdrawals": ZERO, "losses_at_cost": ZERO, "losses_count": 0}
 
 
@@ -725,9 +734,10 @@ def _add_cash(b: dict, mov: dict):
     bucket = cash_category_bucket(mov.get("category"))
     if bucket == "extra":
         b["extra_expenses"] += amount
-    elif bucket == "unknown":
-        b["extra_expenses"] += amount
-        b["unknown_category_expenses"] += amount
+    elif bucket == "unclassified":
+        # Visible e informado, pero NO se resta del resultado operativo.
+        b["unclassified_expenses"] += amount
+        b["unclassified_count"] += 1
     elif bucket == "employee":
         b["employee_payments"] += amount
     elif bucket == "supplier":
@@ -752,7 +762,8 @@ def _bucket_out(b: dict) -> dict:
         "promo_sales_count": b["promo_sales_count"],
         "promo_revenue": money(b["promo_revenue"]),
         "extra_expenses": money(b["extra_expenses"]),
-        "unknown_category_expenses": money(b["unknown_category_expenses"]),
+        "unclassified_expenses": money(b["unclassified_expenses"]),
+        "unclassified_count": b["unclassified_count"],
         "losses_at_cost": money(b["losses_at_cost"]),
         "losses_count": b["losses_count"],
         "employee_payments_info": money(b["employee_payments"]),
@@ -828,9 +839,14 @@ def compute_live_session(plan: dict, sales: List[dict], cash_movements: List[dic
         if abs(diff) > SALE_TOTAL_MISMATCH_TOLERANCE:
             mismatches.append({"sale_id": sale["sale_id"], "total_amount": money(sale["total_amount"]),
                                "items_revenue": money(items_revenue), "difference": money(diff)})
+    unclassified = []
     for mov in cash_movements:
         _add_cash(total, mov)
         _add_cash(day_bucket(mov["date"]), mov)
+        if (mov.get("movement_type") or "").upper() == "OUT" and cash_category_bucket(mov.get("category")) == "unclassified":
+            day = mov["date"]
+            unclassified.append({"date": day.isoformat() if isinstance(day, datetime.date) else day,
+                                 "category": mov.get("category"), "amount": money(D(mov["amount"]))})
     losses_without_cost = 0
     for loss in losses:
         _add_loss(total, loss)
@@ -896,9 +912,13 @@ def compute_live_session(plan: dict, sales: List[dict], cash_movements: List[dic
         warnings.append({"code": "DIFERENCIA_TOTAL_VENTA",
                          "detail": f"{len(mismatches)} venta(s) con total distinto a la suma de sus ítems; "
                                    "se usa el total cobrado"})
-    if total["unknown_category_expenses"] > 0:
+    if unclassified:
+        categories = ", ".join(sorted({str(m["category"] or "(sin categoría)") for m in unclassified}))
         warnings.append({"code": "CATEGORIA_GASTO_NO_RECONOCIDA",
-                         "detail": "Hay gastos de caja con categoría no reconocida; se cuentan como gasto extraordinario"})
+                         "detail": f"{len(unclassified)} movimiento(s) de caja sin clasificar ({categories}) por "
+                                   f"{ar_money(total['unclassified_expenses'])}: NO se restaron del resultado "
+                                   "operativo hasta definir una regla para esa categoría",
+                         "amount": money(total["unclassified_expenses"])})
     end = plan.get("end_date")
     if today is not None and end and today > (datetime.date.fromisoformat(end) if isinstance(end, str) else end):
         warnings.append({"code": "ABIERTA_FUERA_DE_PERIODO",
@@ -928,11 +948,13 @@ def compute_live_session(plan: dict, sales: List[dict], cash_movements: List[dic
                   if today is not None else None),
         "days": [{"date": day.isoformat(), **_bucket_out(b)} for day, b in sorted(days.items())],
         "data_quality": {
-            "complete": not (items_without_cost or losses_without_cost),
+            "complete": not (items_without_cost or losses_without_cost or unclassified),
             "items_without_cost": items_without_cost,
             "items_without_cost_revenue": money(items_without_cost_revenue),
             "losses_without_cost": losses_without_cost,
             "sales_total_mismatches": mismatches,
+            "unclassified_cash_movements": unclassified,
+            "unclassified_expenses": money(total["unclassified_expenses"]),
         },
         "warnings": warnings,
     }

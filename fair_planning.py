@@ -671,10 +671,12 @@ def compute_day_plan(plan: dict, thresholds: dict, lots: List[dict], products: D
 
 LIVE_CALC_VERSION = 1
 
-# Categorías de caja. Solo estas restan como gasto extraordinario (SERVICIO y CAJA_CHICA son
-# alias históricos). Cualquier otra categoría de salida que no figure en estos conjuntos queda
-# "no clasificada": se informa con su monto, pero no modifica el resultado hasta tener una regla.
-CASH_EXTRA_EXPENSE_CATEGORIES = {"OPERATIVO", "SERVICIOS", "SERVICIO", "COMPRA_MENOR", "OTRO", "CAJA_CHICA"}
+# Categorías de caja. Solo estas restan como gasto extraordinario; OPERATIVOS y GASTO_OPERATIVO
+# (= OPERATIVO), SERVICIO (= SERVICIOS), OTROS (= OTRO) y CAJA_CHICA son alias históricos.
+# Cualquier otra categoría de salida que no figure en estos conjuntos queda "no clasificada":
+# se informa con su monto, pero no modifica el resultado hasta tener una regla.
+CASH_EXTRA_EXPENSE_CATEGORIES = {"OPERATIVO", "OPERATIVOS", "GASTO_OPERATIVO", "SERVICIOS", "SERVICIO",
+                                 "COMPRA_MENOR", "OTRO", "OTROS", "CAJA_CHICA"}
 CASH_EMPLOYEE_CATEGORIES = {"EMPLEADO", "EMPLEADOS", "PAGO_EMPLEADO", "SUELDO", "SUELDOS", "SALARIO"}
 CASH_SUPPLIER_CATEGORIES = {"PROVEEDOR", "PROVEEDORES", "PAGO_PROVEEDOR", "MERCADERIA", "COMPRA_MERCADERIA"}
 CASH_OWNER_CATEGORIES = {"RETIRO_DUENO", "RETIRO_DUEÑO", "OWNER_WITHDRAWAL"}

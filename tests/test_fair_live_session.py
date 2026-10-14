@@ -545,12 +545,13 @@ def test_pure_cash_categories_classification():
     plan = {"stall_total": 0, "staff_total": 0, "transport_outbound": 0, "transport_return": 0,
             "end_date": "2026-10-17"}
     day = datetime.date(2026, 10, 17)
-    restan = ("OPERATIVO", "SERVICIOS", "SERVICIO", "COMPRA_MENOR", "OTRO", "CAJA_CHICA", "operativo")
+    restan = ("OPERATIVO", "OPERATIVOS", "GASTO_OPERATIVO", "SERVICIOS", "SERVICIO", "COMPRA_MENOR",
+              "OTRO", "OTROS", "CAJA_CHICA", "operativo")
     no_restan = ("PROVEEDOR", "RETIRO_DUENO", "EMPLEADO")
     movs = [{"date": day, "movement_type": "OUT", "category": c, "amount": 100} for c in restan + no_restan]
     out = fair_planning.compute_live_session(plan, [], movs, [], day, day, None)
-    assert out["result"]["extra_expenses"] == 700
-    assert out["result"]["operating_result"] == -700
+    assert out["result"]["extra_expenses"] == 1000
+    assert out["result"]["operating_result"] == -1000
     acc = out["accumulated"]
     assert acc["employee_payments_info"] == 100
     assert acc["supplier_payments_excluded"] == 100 and acc["owner_withdrawals_excluded"] == 100
@@ -592,9 +593,13 @@ def test_unknown_category_via_api_does_not_change_result(clock):
     add_sale(800000, 400000, t)
     add_cash("SERVICIO", 1000, t)       # alias histórico: resta
     add_cash("CAJA_CHICA", 2000, t)     # alias histórico: resta
+    add_cash("OPERATIVOS", 400, t)      # alias histórico de OPERATIVO: resta
+    add_cash("GASTO_OPERATIVO", 300, t) # alias histórico de OPERATIVO: resta
+    add_cash("OTROS", 300, t)           # alias histórico de OTRO: resta
     clock["now"] = SAT_LATER
     before = live(pid)["result"]
-    assert before["extra_expenses"] == 3000 and before["operating_result"] == -103000
+    assert before["extra_expenses"] == 4000 and before["operating_result"] == -104000
+    assert live(pid)["accumulated"]["unclassified_expenses"] == 0
     add_cash("NUEVA_CATEGORIA", 50000, t)
     data = live(pid)
     assert data["result"] == before

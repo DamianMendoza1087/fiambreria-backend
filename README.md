@@ -63,8 +63,9 @@ Resultado operativo real:
   - costo de mercadería vendida (sale_items.cogs: costo histórico FEFO de la venta)
   = margen bruto
   - costos operativos planificados (puesto + personal + transporte + otros del plan, congelados)
-  - gastos extraordinarios reales (cash_movements OUT: OPERATIVO, SERVICIOS, SERVICIO, COMPRA_MENOR,
-    OTRO, CAJA_CHICA; SERVICIO y CAJA_CHICA son alias históricos)
+  - gastos extraordinarios reales (cash_movements OUT: OPERATIVO, OPERATIVOS, GASTO_OPERATIVO,
+    SERVICIOS, SERVICIO, COMPRA_MENOR, OTRO, OTROS, CAJA_CHICA; los alias históricos
+    OPERATIVOS/GASTO_OPERATIVO = OPERATIVO, SERVICIO = SERVICIOS, OTROS = OTRO)
   - mermas reales a costo (stock_movements LOSS: |cantidad| x unit_cost histórico)
   = resultado operativo real
 

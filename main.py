@@ -4,6 +4,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text, or_, Numeric
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 from typing import List, Optional
 import datetime
@@ -360,6 +361,13 @@ class DayPlanDB(Base):
     updated_by = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # Jornada en vivo (ensure_fair_live_schema las agrega en bases existentes). Fechas en UTC.
+    opened_at = Column(DateTime, nullable=True)
+    opened_by = Column(String, nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    closed_by = Column(String, nullable=True)
+    final_results_json = Column(Text, nullable=True)   # resultado congelado al cerrar
+    final_calc_version = Column(Integer, nullable=True)
 
 class DayPlanSnapshotDB(Base):
     __tablename__ = "day_plan_snapshots"
@@ -488,6 +496,32 @@ def ensure_multilocal_schema():
             ))
 
 ensure_multilocal_schema()
+
+def ensure_fair_live_schema():
+    """Jornada de Feria en vivo: columnas nuevas en day_plans y una sola jornada ABIERTA por sucursal.
+
+    Idempotente: solo agrega lo que falta; no borra ni recrea tablas.
+    """
+    Base.metadata.create_all(bind=engine)
+    plan_cols = {c["name"] for c in inspect(engine).get_columns("day_plans")}
+    additions = {
+        "opened_at": "DATETIME",
+        "opened_by": "VARCHAR",
+        "closed_at": "DATETIME",
+        "closed_by": "VARCHAR",
+        "final_results_json": "TEXT",
+        "final_calc_version": "INTEGER",
+    }
+    with engine.begin() as conn:
+        for column_name, ddl in additions.items():
+            if column_name not in plan_cols:
+                conn.execute(text(f"ALTER TABLE day_plans ADD COLUMN {column_name} {ddl}"))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_day_plans_one_open_per_branch "
+            "ON day_plans (branch_id) WHERE status = 'ABIERTA'"
+        ))
+
+ensure_fair_live_schema()
 
 app = FastAPI(title="Fiambrería POS, RRHH, MRP, KPIs & Permisos API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -3180,7 +3214,8 @@ def _fmt_ddmmyyyy(iso: Optional[str]) -> Optional[str]:
 
 
 def _plan_out(plan) -> dict:
-    out = {c.name: getattr(plan, c.name) for c in DayPlanDB.__table__.columns}
+    # El resultado final de la jornada se entrega por /day-plans/{id}/live, no en cada listado.
+    out = {c.name: getattr(plan, c.name) for c in DayPlanDB.__table__.columns if c.name != "final_results_json"}
     for k, v in out.items():
         if isinstance(v, Decimal):
             out[k] = fair_planning.money(v)
@@ -3188,8 +3223,16 @@ def _plan_out(plan) -> dict:
     out["end_date_display"] = _fmt_ddmmyyyy(plan.end_date)
     for k in ("created_at", "updated_at"):
         out[k] = out[k].isoformat() if out[k] else None
-    out["operating_cost_total"] = fair_planning.money(
-        D(plan.stall_total) + D(plan.staff_total) + D(plan.transport_total) + D(plan.other_expenses))
+    for k in ("opened_at", "closed_at"):
+        out[k] = utc_to_ar(out[k]).isoformat() if out[k] else None
+    opex = D(plan.stall_total) + D(plan.staff_total) + D(plan.transport_total) + D(plan.other_expenses)
+    out["operating_cost_total"] = fair_planning.money(opex)
+    tg = fair_planning.targets(opex, D(plan.debt_target), D(plan.profit_target))
+    out["objective_equilibrium"] = fair_planning.money(tg["g_eq"])
+    out["objective_with_debt"] = fair_planning.money(tg["g_debt"])
+    out["objective_total"] = fair_planning.money(tg["g_obj"])
+    out["has_final_results"] = plan.final_results_json is not None
+    out["can_open_today"] = _plan_can_open_on(plan, utc_to_ar(_fair_live_utc_now()).date())
     return out
 
 
@@ -3287,8 +3330,17 @@ def list_day_plans(branch_id: int = FAIR_BRANCH_ID, status: Optional[str] = None
         item["latest_snapshot"] = _snapshot_summary(latest) if latest else None
         if latest:
             item["latest_snapshot"]["headline"] = json.loads(latest.results_json).get("headline")
+        item["session_summary"] = _session_summary(db, plan)
         result.append(item)
     return result
+
+
+@app.get("/day-plans/open")
+def get_open_day_plan(branch_id: int = FAIR_BRANCH_ID, db: Session = Depends(get_db)):
+    """Jornada ABIERTA de la sucursal (como máximo una)."""
+    _require_fair_branch(branch_id, db)
+    plan = _open_fair_session(db, branch_id)
+    return {"open": plan is not None, "plan": _plan_out(plan) if plan else None}
 
 
 @app.get("/day-plans/{plan_id}")
@@ -3383,3 +3435,205 @@ def change_day_plan_status(plan_id: int, payload: DayPlanStatusSchema, db: Sessi
     db.commit()
     db.refresh(plan)
     return _plan_detail(db, plan)
+
+
+# =====================================================================
+# JORNADA DE FERIA EN VIVO
+# Observa las ventas, gastos de caja y mermas reales de Feria dentro de la ventana
+# opened_at..closed_at (o ahora). No crea ni modifica ventas, stock ni caja.
+# El cálculo vive en fair_planning.compute_live_session.
+# =====================================================================
+
+FAIR_SESSION_ROLES = ("masteradmin", "superadmin", "dueno")
+
+class DayPlanSessionActionSchema(BaseModel):
+    actor: Optional[str] = None
+
+
+def _fair_live_utc_now() -> datetime.datetime:
+    """Hora actual en UTC naive, igual que sales.created_at (los tests la reemplazan)."""
+    return datetime.datetime.utcnow()
+
+
+def _plan_can_open_on(plan, today_ar: datetime.date) -> bool:
+    if plan.status not in DAY_PLAN_EDITABLE_STATUSES:
+        return False
+    return datetime.date.fromisoformat(plan.start_date) <= today_ar <= datetime.date.fromisoformat(plan.end_date)
+
+
+def _require_fair_session_actor(db: Session, actor: Optional[str]) -> str:
+    # Validación de COHERENCIA, no autenticación real: el backend todavía no verifica
+    # tokens, así que no puede comprobar que el email informado sea el de quien opera.
+    email = (actor or "").strip()
+    if not email:
+        raise HTTPException(status_code=422, detail="Indicá el usuario que inicia o cierra la jornada")
+    user = db.query(UserDB).filter(func.lower(UserDB.email) == email.lower()).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=403, detail="El usuario no existe o está inhabilitado")
+    if (user.role or "") not in FAIR_SESSION_ROLES:
+        raise HTTPException(status_code=403, detail="Solo administración o dueño pueden iniciar o cerrar la jornada")
+    return user.email
+
+
+def _open_fair_session(db: Session, branch_id: int):
+    return db.query(DayPlanDB).filter(DayPlanDB.branch_id == branch_id, DayPlanDB.status == "ABIERTA") \
+        .order_by(DayPlanDB.id.desc()).first()
+
+
+def _open_conflict_message(current) -> str:
+    return (f"Ya hay una jornada en curso (plan #{current.id}, {_fmt_ddmmyyyy(current.start_date)}"
+            f"{' - ' + _fmt_ddmmyyyy(current.end_date) if current.end_date != current.start_date else ''}). "
+            "Usá «Ver jornada en curso».")
+
+
+def _plan_economics(plan) -> dict:
+    """Montos congelados del plan (los de la base; nunca la configuración actual)."""
+    return {
+        "plan_type": plan.plan_type, "start_date": plan.start_date, "end_date": plan.end_date,
+        "days_count": plan.days_count,
+        "stall_total": D(plan.stall_total), "staff_total": D(plan.staff_total),
+        "transport_outbound": D(plan.transport_outbound), "transport_return": D(plan.transport_return),
+        "other_expenses": D(plan.other_expenses), "debt_target": D(plan.debt_target),
+        "profit_target": D(plan.profit_target), "capital_available": D(plan.capital_available),
+    }
+
+
+def _session_payload(db: Session, plan, until_utc: datetime.datetime, today_ar: Optional[datetime.date],
+                     source: str) -> dict:
+    since = plan.opened_at
+    sales = db.query(SaleDB).filter(
+        SaleDB.branch_id == plan.branch_id, SaleDB.created_at >= since, SaleDB.created_at <= until_utc
+    ).order_by(SaleDB.created_at, SaleDB.id).all()
+    sale_rows = [{
+        "sale_id": s.id, "date": utc_to_ar(s.created_at).date(), "total_amount": s.total_amount,
+        # cogs: costo histórico FEFO guardado al vender; nunca el costo actual del producto.
+        "items": [{"revenue": D(i.unit_price) * D(i.quantity), "cogs": i.cogs,
+                   "is_promotion": bool(i.is_promotion)} for i in s.items],
+    } for s in sales]
+    movements = db.query(CashMovementDB).filter(
+        CashMovementDB.branch_id == plan.branch_id, CashMovementDB.created_at >= since,
+        CashMovementDB.created_at <= until_utc
+    ).all()
+    cash_rows = [{"date": utc_to_ar(m.created_at).date(), "movement_type": m.movement_type,
+                  "category": m.category, "amount": m.amount} for m in movements]
+    losses = db.query(StockMovementDB).filter(
+        StockMovementDB.branch_id == plan.branch_id, StockMovementDB.movement_type == "LOSS",
+        StockMovementDB.created_at >= since, StockMovementDB.created_at <= until_utc
+    ).all()
+    loss_rows = [{"date": utc_to_ar(x.created_at).date(), "quantity": x.quantity, "unit_cost": x.unit_cost}
+                 for x in losses]
+    result = fair_planning.compute_live_session(
+        _plan_economics(plan), sale_rows, cash_rows, loss_rows,
+        utc_to_ar(since).date(), utc_to_ar(until_utc).date(), today_ar)
+    if source == "FINAL_SNAPSHOT" and utc_to_ar(until_utc).date() > datetime.date.fromisoformat(plan.end_date):
+        result["warnings"].append({"code": "CERRADA_FUERA_DE_PERIODO",
+                                   "detail": "La jornada se cerró después del período planificado"})
+    branch = db.query(BranchDB).filter(BranchDB.id == plan.branch_id).first()
+    return {
+        "source": source,
+        "plan_id": plan.id,
+        "branch_id": plan.branch_id,
+        "branch_name": branch.name if branch else None,
+        "plan_type": plan.plan_type,
+        "start_date": plan.start_date, "end_date": plan.end_date,
+        "start_date_display": _fmt_ddmmyyyy(plan.start_date), "end_date_display": _fmt_ddmmyyyy(plan.end_date),
+        "days_count": plan.days_count,
+        "multi_day": plan.start_date != plan.end_date,
+        "status": plan.status,
+        "opened_at": utc_to_ar(plan.opened_at).isoformat(), "opened_by": plan.opened_by,
+        "closed_at": utc_to_ar(plan.closed_at).isoformat() if plan.closed_at else None,
+        "closed_by": plan.closed_by,
+        "computed_at": utc_to_ar(until_utc).isoformat(),
+        "elapsed_minutes": int((until_utc - since).total_seconds() // 60),
+        **result,
+    }
+
+
+def _session_summary(db: Session, plan) -> Optional[dict]:
+    if plan.status == "CERRADA" and plan.final_results_json:
+        data = json.loads(plan.final_results_json)
+    elif plan.status == "ABIERTA" and plan.opened_at:
+        now = _fair_live_utc_now()
+        data = _session_payload(db, plan, now, utc_to_ar(now).date(), "LIVE")
+    else:
+        return None
+    return {"source": data["source"], "revenue": data["result"]["revenue"],
+            "gross_margin": data["result"]["gross_margin"], "operating_result": data["result"]["operating_result"],
+            "indicator": data["indicator"]}
+
+
+@app.post("/day-plans/{plan_id}/open")
+def open_day_plan_session(plan_id: int, payload: DayPlanSessionActionSchema, db: Session = Depends(get_db)):
+    actor = _require_fair_session_actor(db, payload.actor)
+    plan = _get_plan_or_404(db, plan_id)
+    _require_fair_branch(plan.branch_id, db)
+    if plan.status == "ABIERTA":
+        raise HTTPException(status_code=409, detail="La jornada ya está abierta")
+    if plan.status == "CERRADA":
+        raise HTTPException(status_code=409, detail="La jornada ya fue cerrada y no puede volver a abrirse")
+    if plan.status == "CANCELADA":
+        raise HTTPException(status_code=409, detail="Un plan cancelado no puede iniciarse")
+    if plan.status not in DAY_PLAN_EDITABLE_STATUSES:
+        raise HTTPException(status_code=409, detail=f"No se puede iniciar un plan en estado {plan.status}")
+    now = _fair_live_utc_now()
+    today = utc_to_ar(now).date()
+    if not _plan_can_open_on(plan, today):
+        raise HTTPException(status_code=409, detail=(
+            f"Esta jornada solo puede iniciarse entre el {_fmt_ddmmyyyy(plan.start_date)} y el "
+            f"{_fmt_ddmmyyyy(plan.end_date)} (hoy es {today.strftime('%d/%m/%Y')})."))
+    current = _open_fair_session(db, plan.branch_id)
+    if current:
+        raise HTTPException(status_code=409, detail=_open_conflict_message(current))
+    # Actualización condicional + índice único parcial: ante dos pedidos simultáneos solo uno abre.
+    try:
+        changed = db.query(DayPlanDB).filter(
+            DayPlanDB.id == plan.id, DayPlanDB.status.in_(DAY_PLAN_EDITABLE_STATUSES)
+        ).update({"status": "ABIERTA", "opened_at": now, "opened_by": actor,
+                  "updated_by": actor, "updated_at": now}, synchronize_session=False)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        current = _open_fair_session(db, plan.branch_id)
+        raise HTTPException(status_code=409, detail=_open_conflict_message(current) if current
+                            else "Ya hay una jornada en curso")
+    if not changed:
+        raise HTTPException(status_code=409, detail="El plan cambió de estado; actualizá la pantalla")
+    db.refresh(plan)
+    return _session_payload(db, plan, now, today, "LIVE")
+
+
+@app.get("/day-plans/{plan_id}/live")
+def get_day_plan_live(plan_id: int, db: Session = Depends(get_db)):
+    plan = _get_plan_or_404(db, plan_id)
+    if plan.status == "CERRADA":
+        if not plan.final_results_json:
+            raise HTTPException(status_code=409, detail="La jornada cerrada no tiene resultado final guardado")
+        # Solo lectura: nunca se recalcula una jornada cerrada.
+        return json.loads(plan.final_results_json)
+    if plan.status != "ABIERTA" or not plan.opened_at:
+        raise HTTPException(status_code=409, detail="La jornada todavía no fue iniciada")
+    now = _fair_live_utc_now()
+    return _session_payload(db, plan, now, utc_to_ar(now).date(), "LIVE")
+
+
+@app.post("/day-plans/{plan_id}/close")
+def close_day_plan_session(plan_id: int, payload: DayPlanSessionActionSchema, db: Session = Depends(get_db)):
+    actor = _require_fair_session_actor(db, payload.actor)
+    plan = _get_plan_or_404(db, plan_id)
+    if plan.status == "CERRADA":
+        raise HTTPException(status_code=409, detail="La jornada ya fue cerrada")
+    if plan.status != "ABIERTA" or not plan.opened_at:
+        raise HTTPException(status_code=409, detail="Solo puede cerrarse una jornada ABIERTA")
+    now = _fair_live_utc_now()
+    plan.status, plan.closed_at, plan.closed_by = "CERRADA", now, actor
+    final = _session_payload(db, plan, now, None, "FINAL_SNAPSHOT")
+    db.expire(plan)  # la escritura real es la actualización condicional de abajo
+    changed = db.query(DayPlanDB).filter(DayPlanDB.id == plan_id, DayPlanDB.status == "ABIERTA").update({
+        "status": "CERRADA", "closed_at": now, "closed_by": actor, "updated_by": actor, "updated_at": now,
+        "final_results_json": json.dumps(final, ensure_ascii=False),
+        "final_calc_version": fair_planning.LIVE_CALC_VERSION,
+    }, synchronize_session=False)
+    db.commit()
+    if not changed:
+        raise HTTPException(status_code=409, detail="La jornada ya fue cerrada")
+    return final

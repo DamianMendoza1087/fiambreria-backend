@@ -650,3 +650,289 @@ def compute_day_plan(plan: dict, thresholds: dict, lots: List[dict], products: D
         },
         "warnings": warnings,
     }
+
+
+# ===========================================================================
+# Jornada de Feria en vivo (durante y después de la Feria)
+# ===========================================================================
+#
+# Observa las ventas reales ya registradas (no crea ni modifica ventas). main.py lee las
+# filas de la ventana de la jornada y las pasa ya con su fecha argentina; acá solo se calcula.
+#
+# Resultado operativo real =
+#     ventas (sales.total_amount)
+#   - costo de mercadería vendida (sale_items.cogs, histórico FEFO)
+#   = margen bruto
+#   - costos operativos planificados (puesto + personal + transporte + otros del plan)
+#   - gastos extraordinarios reales (caja: OPERATIVO, SERVICIOS, COMPRA_MENOR, OTRO)
+#   - mermas reales a costo (stock_movements LOSS: |cantidad| x costo histórico)
+#
+# Deuda y ganancia deseada son OBJETIVOS: nunca se restan como gasto.
+
+LIVE_CALC_VERSION = 1
+
+# Categorías de caja (las mismas variantes que reconoce el KPI de rentabilidad).
+CASH_EXTRA_EXPENSE_CATEGORIES = {"OPERATIVO", "OPERATIVOS", "GASTO_OPERATIVO", "SERVICIO", "SERVICIOS",
+                                 "COMPRA_MENOR", "CAJA_CHICA", "OTRO", "OTROS"}
+CASH_EMPLOYEE_CATEGORIES = {"EMPLEADO", "EMPLEADOS", "PAGO_EMPLEADO", "SUELDO", "SUELDOS", "SALARIO"}
+CASH_SUPPLIER_CATEGORIES = {"PROVEEDOR", "PROVEEDORES", "PAGO_PROVEEDOR", "MERCADERIA", "COMPRA_MERCADERIA"}
+CASH_OWNER_CATEGORIES = {"RETIRO_DUENO", "RETIRO_DUEÑO", "OWNER_WITHDRAWAL"}
+
+# Diferencia entre sales.total_amount y la suma de sus ítems que se informa como advertencia.
+SALE_TOTAL_MISMATCH_TOLERANCE = Decimal("1.00")
+
+LIVE_INDICATOR_LABELS = {
+    "FALTA_EQUILIBRIO": "🔴 FALTA PARA EQUILIBRIO",
+    "EQUILIBRIO_ALCANZADO": "🟡 EQUILIBRIO ALCANZADO",
+    "OBJETIVO_ALCANZADO": "🟢 OBJETIVO ALCANZADO",
+}
+
+
+def cash_category_bucket(category: Optional[str]) -> str:
+    c = (category or "").strip().upper()
+    if c in CASH_EXTRA_EXPENSE_CATEGORIES:
+        return "extra"
+    if c in CASH_EMPLOYEE_CATEGORIES:
+        return "employee"
+    if c in CASH_SUPPLIER_CATEGORIES:
+        return "supplier"
+    if c in CASH_OWNER_CATEGORIES:
+        return "owner"
+    # Categoría desconocida: se cuenta como gasto real (no se esconde) y se advierte.
+    return "unknown"
+
+
+def _empty_bucket() -> dict:
+    return {"sales_count": 0, "revenue": ZERO, "cogs": ZERO, "promo_sales_count": 0, "promo_revenue": ZERO,
+            "extra_expenses": ZERO, "unknown_category_expenses": ZERO, "employee_payments": ZERO,
+            "supplier_payments": ZERO, "owner_withdrawals": ZERO, "losses_at_cost": ZERO, "losses_count": 0}
+
+
+def _add_sale(b: dict, sale: dict):
+    total = D(sale["total_amount"])
+    b["sales_count"] += 1
+    b["revenue"] += total
+    b["cogs"] += sum((D(i["cogs"]) for i in sale["items"]), ZERO)
+    if any(i.get("is_promotion") for i in sale["items"]):
+        b["promo_sales_count"] += 1
+        b["promo_revenue"] += total
+
+
+def _add_cash(b: dict, mov: dict):
+    if (mov.get("movement_type") or "").upper() != "OUT":
+        return  # los ingresos de caja no son ventas ni gastos de la jornada
+    amount = D(mov["amount"])
+    bucket = cash_category_bucket(mov.get("category"))
+    if bucket == "extra":
+        b["extra_expenses"] += amount
+    elif bucket == "unknown":
+        b["extra_expenses"] += amount
+        b["unknown_category_expenses"] += amount
+    elif bucket == "employee":
+        b["employee_payments"] += amount
+    elif bucket == "supplier":
+        b["supplier_payments"] += amount
+    else:
+        b["owner_withdrawals"] += amount
+
+
+def _add_loss(b: dict, loss: dict):
+    b["losses_count"] += 1
+    b["losses_at_cost"] += abs(D(loss["quantity"])) * max(D(loss.get("unit_cost")), ZERO)
+
+
+def _bucket_out(b: dict) -> dict:
+    gross = b["revenue"] - b["cogs"]
+    return {
+        "sales_count": b["sales_count"],
+        "revenue": money(b["revenue"]),
+        "cogs": money(b["cogs"]),
+        "gross_margin": money(gross),
+        "gross_margin_pct": ratio(gross / b["revenue"]) if b["revenue"] > 0 else None,
+        "promo_sales_count": b["promo_sales_count"],
+        "promo_revenue": money(b["promo_revenue"]),
+        "extra_expenses": money(b["extra_expenses"]),
+        "unknown_category_expenses": money(b["unknown_category_expenses"]),
+        "losses_at_cost": money(b["losses_at_cost"]),
+        "losses_count": b["losses_count"],
+        "employee_payments_info": money(b["employee_payments"]),
+        "supplier_payments_excluded": money(b["supplier_payments"]),
+        "owner_withdrawals_excluded": money(b["owner_withdrawals"]),
+    }
+
+
+def _objective(required: Decimal, plan_required: Decimal, gross: Decimal, margin_pct: Optional[Decimal]) -> dict:
+    missing = max(required - gross, ZERO)
+    surplus = max(gross - required, ZERO)
+    reached = gross >= required
+    if required > 0:
+        progress = gross / required if gross > 0 else ZERO
+    else:
+        progress = ONE if reached else ZERO
+    est_sales = None
+    if missing > 0 and margin_pct is not None and margin_pct > 0:
+        est_sales = missing / margin_pct
+    return {
+        "required_margin": money(required),
+        "plan_required_margin": money(plan_required),
+        "gross_margin": money(gross),
+        "missing": money(missing),
+        "surplus": money(surplus),
+        "reached": reached,
+        "progress_pct": ratio(progress),
+        "estimated_sales_missing": money(est_sales),
+    }
+
+
+def compute_live_session(plan: dict, sales: List[dict], cash_movements: List[dict], losses: List[dict],
+                         first_day: datetime.date, last_day: datetime.date,
+                         today: Optional[datetime.date]) -> dict:
+    """Resultado de una jornada (en vivo o al cierre).
+
+    plan: montos congelados del Day Plan (stall_total, staff_total, transport_*, other_expenses,
+          debt_target, profit_target, capital_available) y start_date/end_date ISO.
+    sales: [{sale_id, date (fecha AR), total_amount, items: [{revenue, cogs, is_promotion}]}]
+    cash_movements: [{date, movement_type, category, amount}]
+    losses: [{date, quantity, unit_cost}]
+    first_day/last_day: fechas argentinas de apertura y de corte (ahora o cierre).
+    today: fecha argentina actual para el bloque HOY (None al cerrar).
+    """
+    costs = operating_costs(plan)
+    opex = costs["opex"]
+    debt = D(plan.get("debt_target"))
+    profit = D(plan.get("profit_target"))
+
+    total = _empty_bucket()
+    days: Dict[datetime.date, dict] = {}
+    d = first_day
+    while d <= last_day:
+        days[d] = _empty_bucket()
+        d += datetime.timedelta(days=1)
+
+    def day_bucket(day):
+        return days.setdefault(day, _empty_bucket())
+
+    items_without_cost = 0
+    items_without_cost_revenue = ZERO
+    mismatches = []
+    for sale in sales:
+        _add_sale(total, sale)
+        _add_sale(day_bucket(sale["date"]), sale)
+        items_revenue = ZERO
+        for item in sale["items"]:
+            items_revenue += D(item["revenue"])
+            if D(item["cogs"]) <= 0:
+                items_without_cost += 1
+                items_without_cost_revenue += D(item["revenue"])
+        diff = D(sale["total_amount"]) - items_revenue
+        if abs(diff) > SALE_TOTAL_MISMATCH_TOLERANCE:
+            mismatches.append({"sale_id": sale["sale_id"], "total_amount": money(sale["total_amount"]),
+                               "items_revenue": money(items_revenue), "difference": money(diff)})
+    for mov in cash_movements:
+        _add_cash(total, mov)
+        _add_cash(day_bucket(mov["date"]), mov)
+    losses_without_cost = 0
+    for loss in losses:
+        _add_loss(total, loss)
+        _add_loss(day_bucket(loss["date"]), loss)
+        if D(loss.get("unit_cost")) <= 0:
+            losses_without_cost += 1
+
+    revenue, cogs = total["revenue"], total["cogs"]
+    gross = revenue - cogs
+    extra, loss_cost = total["extra_expenses"], total["losses_at_cost"]
+    real_costs = opex + extra + loss_cost
+    operating_result = gross - real_costs
+    margin_pct = gross / revenue if revenue > 0 else None
+
+    objectives = {
+        "equilibrium": _objective(real_costs, opex, gross, margin_pct),
+        "debt": {**_objective(real_costs + debt, opex + debt, gross, margin_pct),
+                 "objective_amount": money(debt), "applies": debt > 0},
+        "total": {**_objective(real_costs + debt + profit, opex + debt + profit, gross, margin_pct),
+                  "objective_amount": money(debt + profit), "applies": (debt + profit) > 0},
+    }
+    objectives["profit"] = {"objective_amount": money(profit), "applies": profit > 0}
+
+    if operating_result < 0:
+        indicator = "FALTA_EQUILIBRIO"
+    elif operating_result >= debt + profit:
+        indicator = "OBJETIVO_ALCANZADO"
+    else:
+        indicator = "EQUILIBRIO_ALCANZADO"
+
+    # Clasificación: pueden coexistir varios conceptos.
+    outcomes = []
+    if operating_result < 0:
+        outcomes.append({"code": "PERDIDA_OPERATIVA", "label": "🔴 Pérdida operativa", "amount": money(operating_result)})
+    elif operating_result == 0:
+        outcomes.append({"code": "EQUILIBRIO", "label": "🟡 Equilibrio", "amount": money(operating_result)})
+    else:
+        outcomes.append({"code": "GANANCIA_OPERATIVA", "label": "🟢 Ganancia operativa", "amount": money(operating_result)})
+    if debt > 0:
+        if operating_result >= debt:
+            outcomes.append({"code": "OBJETIVO_DEUDA_ALCANZADO", "label": "🟢 Objetivo de deuda alcanzado",
+                             "amount": money(operating_result - debt)})
+        else:
+            outcomes.append({"code": "OBJETIVO_DEUDA_NO_ALCANZADO", "label": "🟡 Objetivo de deuda: faltan",
+                             "amount": money(debt - max(operating_result, ZERO))})
+    if debt + profit > 0:
+        if operating_result >= debt + profit:
+            outcomes.append({"code": "OBJETIVO_TOTAL_ALCANZADO", "label": "🟢 Objetivo total alcanzado",
+                             "amount": money(operating_result - debt - profit)})
+        else:
+            outcomes.append({"code": "OBJETIVO_TOTAL_NO_ALCANZADO", "label": "🟡 Objetivo total: faltan",
+                             "amount": money(debt + profit - max(operating_result, ZERO))})
+
+    warnings = []
+    if items_without_cost:
+        warnings.append({"code": "COSTO_INCOMPLETO",
+                         "detail": f"{items_without_cost} ítem(s) vendido(s) sin costo registrado: "
+                                   "el costo y el margen pueden estar incompletos"})
+    if losses_without_cost:
+        warnings.append({"code": "MERMA_SIN_COSTO",
+                         "detail": f"{losses_without_cost} merma(s) sin costo registrado: no se valorizaron"})
+    if mismatches:
+        warnings.append({"code": "DIFERENCIA_TOTAL_VENTA",
+                         "detail": f"{len(mismatches)} venta(s) con total distinto a la suma de sus ítems; "
+                                   "se usa el total cobrado"})
+    if total["unknown_category_expenses"] > 0:
+        warnings.append({"code": "CATEGORIA_GASTO_NO_RECONOCIDA",
+                         "detail": "Hay gastos de caja con categoría no reconocida; se cuentan como gasto extraordinario"})
+    end = plan.get("end_date")
+    if today is not None and end and today > (datetime.date.fromisoformat(end) if isinstance(end, str) else end):
+        warnings.append({"code": "ABIERTA_FUERA_DE_PERIODO",
+                         "detail": "⚠️ Esta jornada continúa abierta fuera del período planificado."})
+
+    return {
+        "live_calc_version": LIVE_CALC_VERSION,
+        "indicator": {"code": indicator, "label": LIVE_INDICATOR_LABELS[indicator]},
+        "result": {
+            "revenue": money(revenue),
+            "cogs": money(cogs),
+            "gross_margin": money(gross),
+            "gross_margin_pct": ratio(margin_pct),
+            "planned_operating_costs": money(opex),
+            "extra_expenses": money(extra),
+            "losses_at_cost": money(loss_cost),
+            "real_costs_total": money(real_costs),
+            "operating_result": money(operating_result),
+        },
+        "planned_operating_costs": {k: money(v) for k, v in costs.items()},
+        "targets": {"debt_target": money(debt), "profit_target": money(profit),
+                    "capital_available": money(D(plan.get("capital_available")))},
+        "objectives": objectives,
+        "outcomes": outcomes,
+        "accumulated": _bucket_out(total),
+        "today": ({"date": today.isoformat(), **_bucket_out(days.get(today) or _empty_bucket())}
+                  if today is not None else None),
+        "days": [{"date": day.isoformat(), **_bucket_out(b)} for day, b in sorted(days.items())],
+        "data_quality": {
+            "complete": not (items_without_cost or losses_without_cost),
+            "items_without_cost": items_without_cost,
+            "items_without_cost_revenue": money(items_without_cost_revenue),
+            "losses_without_cost": losses_without_cost,
+            "sales_total_mismatches": mismatches,
+        },
+        "warnings": warnings,
+    }

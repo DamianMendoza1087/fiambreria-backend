@@ -113,9 +113,13 @@ Endpoints:
 - `DELETE /branches/{b}/products/{p}?confirm_stock=true&actor=...&reason=...`: retira solo en esa
   sucursal (`is_available=false`). No borra producto maestro, partidas ni historial. Con stock y sin
   `confirm_stock=true` responde 409 con header `X-Error-Code: RETIRE_REQUIRES_CONFIRMATION`.
-- `POST /branches/{b}/products/{p}/reactivate` `{actor, reason}`: exige precio de sucursal > 0.
+- `POST /branches/{b}/products/{p}/reactivate` `{actor, reason}`: exige precio de sucursal > 0
+  (409 `X-Error-Code: BRANCH_PRICE_REQUIRED_FOR_REACTIVATION`; nunca usa el precio global).
 - `POST /ingresses`: si el producto está RETIRADO en la sucursal responde 409
   (`X-Error-Code: PRODUCT_RETIRED_IN_BRANCH`) salvo `reactivate_branch_product: true`.
+  Con esa confirmación aplica la MISMA regla de precio que `/reactivate`: sin precio de sucursal > 0
+  responde `BRANCH_PRICE_REQUIRED_FOR_REACTIVATION` y no registra ingreso, partida, movimiento ni
+  cambio de disponibilidad. El listado de administración agrega `branch_price_configured`.
 
 Retirar, reactivar y la reactivación desde un ingreso quedan en `audit_events`
 (`entity_type = 'branch_product'`). El `actor` todavía lo informa la app: es trazabilidad, no

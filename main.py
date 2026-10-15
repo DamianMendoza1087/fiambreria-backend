@@ -531,6 +531,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 # para que las versiones anteriores de la app muestren un mensaje claro.
 ERROR_RETIRE_REQUIRES_CONFIRMATION = "RETIRE_REQUIRES_CONFIRMATION"
 ERROR_PRODUCT_RETIRED_IN_BRANCH = "PRODUCT_RETIRED_IN_BRANCH"
+ERROR_BRANCH_PRICE_REQUIRED = "BRANCH_PRICE_REQUIRED_FOR_REACTIVATION"
 
 
 def _coded_error(status_code: int, code: str, detail: str) -> HTTPException:
@@ -1279,6 +1280,8 @@ def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
             "is_available": bool(config.is_available) if config else False,
             "is_exclusive": bool(config.is_exclusive) if config else False,
             "branch_status": _branch_status(config),
+            # Precio propio de la sucursal, sin respaldo al precio global (None si no está configurado).
+            "branch_price_configured": config.price_per_unit if config else None,
             "branch_id": branch_id
         })
 
@@ -1324,6 +1327,20 @@ def _get_active_branch_or_404(db: Session, branch_id: int) -> BranchDB:
     if not branch:
         raise HTTPException(status_code=404, detail="Sucursal no encontrada")
     return branch
+
+
+def _require_branch_price_for_reactivation(config, product_name: str, branch_name: str):
+    """Regla única: un producto RETIRADO solo vuelve a DISPONIBLE con precio de sucursal propio > 0.
+
+    Nunca usa products.price_per_unit como respaldo. Se llama ANTES de modificar nada.
+    """
+    price = config.price_per_unit if config is not None else None
+    if price is None or price <= 0:
+        raise _coded_error(
+            409, ERROR_BRANCH_PRICE_REQUIRED,
+            f"{product_name} no tiene un precio de venta mayor a 0 configurado para {branch_name}. "
+            "Configurá primero el precio de esta sucursal (Stock > Administración por Sucursal) y después reactivalo."
+        )
 
 
 def _format_qty(qty: float, unit_type: Optional[str]) -> str:
@@ -1498,7 +1515,7 @@ def reactivate_branch_product(
     db: Session = Depends(get_db)
 ):
     """Vuelve a habilitar en la sucursal un producto RETIRADO, con su precio de sucursal ya configurado."""
-    _get_active_branch_or_404(db, branch_id)
+    branch = _get_active_branch_or_404(db, branch_id)
     product = db.query(ProductDB).filter(ProductDB.id == product_id, ProductDB.is_active == True).first()
     if not product:
         raise HTTPException(status_code=404, detail="Producto no encontrado o inactivo")
@@ -1515,8 +1532,7 @@ def reactivate_branch_product(
                 "price_per_unit": config.price_per_unit}
 
     # El precio de venta debe ser explícito en la sucursal: no se reactiva con precio vacío o 0.
-    if config.price_per_unit is None or config.price_per_unit <= 0:
-        raise HTTPException(status_code=409, detail="Configurá un precio de venta mayor a 0 para esta sucursal antes de reactivar el producto")
+    _require_branch_price_for_reactivation(config, product.name, branch.name)
 
     config.is_available = True
     actor = ((payload.actor if payload else None) or "").strip() or "Anonimo"
@@ -2003,6 +2019,9 @@ def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session
                 f"{product.name} está retirado de {branch.name}. Confirmá que querés reactivarlo "
                 "para registrar este ingreso, o reactivalo desde Stock."
             )
+        # Misma regla que /reactivate. Se valida antes de tocar disponibilidad, lotes, ingreso o
+        # movimientos: si falla, no queda nada registrado.
+        _require_branch_price_for_reactivation(config, product.name, branch.name)
         config.is_available = True
         db.add(AuditEventDB(
             entity_type="branch_product", entity_id=config.id,

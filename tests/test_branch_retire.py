@@ -186,11 +186,24 @@ def test_reactivate_restores_availability_with_branch_price():
     assert audit_rows(pid)[-1][:3] == ("False", "True", "dueno@test")
 
 
-def test_reactivate_requires_explicit_branch_price():
-    pid = make_product(configs=((2, None, False),))
+@pytest.mark.parametrize("price", [None, 0.0])
+def test_reactivate_requires_explicit_branch_price(price):
+    pid = make_product(configs=((2, price, False),))
     r = client.post(f"/branches/2/products/{pid}/reactivate", json={})
     assert r.status_code == 409
+    assert r.headers["X-Error-Code"] == "BRANCH_PRICE_REQUIRED_FOR_REACTIVATION"
+    assert isinstance(r.json()["detail"], str)
     assert config_row(pid, 2)["is_available"] is False
+    assert audit_rows(pid) == []
+
+
+def test_admin_list_exposes_configured_branch_price_without_global_fallback():
+    priced = make_product("Con precio")
+    unpriced = make_product("Sin precio", configs=((2, None, False),))
+    assert admin_row(2, priced)["branch_price_configured"] == 5000.0
+    row = admin_row(2, unpriced)
+    assert row["branch_price_configured"] is None
+    assert row["branch_price"] == 4000            # el campo histórico sigue mostrando el respaldo global
 
 
 def test_reactivate_is_idempotent_and_404_when_not_configured():
@@ -210,6 +223,21 @@ def ingress(pid, **extra):
     return client.post("/ingresses?branch_id=2", json=payload)
 
 
+def ingress_trace(product_id):
+    """Todo lo que un ingreso crea o modifica, para verificar que un rechazo no deja rastros."""
+    db = main.SessionLocal()
+    p = db.query(main.ProductDB).filter_by(id=product_id).first()
+    data = {
+        "ingresses": db.query(main.ProductIngressDB).filter_by(product_id=product_id).count(),
+        "lots": db.query(main.ProductLotDB).filter_by(product_id=product_id).count(),
+        "movements": db.query(main.StockMovementDB).filter_by(product_id=product_id).count(),
+        "product": (p.stock, p.cost_price, p.previous_cost_price, p.supplier, p.is_active),
+        "audits": len(audit_rows(product_id)),
+    }
+    db.close()
+    return data
+
+
 def test_ingress_on_retired_product_requires_explicit_reactivation():
     pid = make_product()
     retire(2, pid)
@@ -225,6 +253,45 @@ def test_ingress_on_retired_product_requires_explicit_reactivation():
     assert lots_of(pid, 2) == [(7, 7, 1500)]
     assert config_row(pid, 2)["is_available"] is True
     assert audit_rows(pid)[-1][:3] == ("False", "True", "recibe@test")
+
+
+def test_retired_with_price_and_confirmation_ingresses_and_reactivates():
+    pid = make_product(configs=((2, 5000.0, False),))
+    before = ingress_trace(pid)
+    r = ingress(pid, reactivate_branch_product=True)
+    assert r.status_code == 200, r.text
+    after = ingress_trace(pid)
+    assert (after["ingresses"], after["lots"], after["movements"]) == (1, 1, 1)
+    assert after["audits"] == before["audits"] + 1
+    assert config_row(pid, 2) == {"is_available": True, "price": 5000.0}
+    assert any(p["id"] == pid and p["price_per_unit"] == 5000.0
+               for p in client.get("/products?branch_id=2").json())
+
+
+@pytest.mark.parametrize("price", [0.0, None])
+def test_retired_without_valid_price_rejects_ingress_atomically(price):
+    pid = make_product(configs=((2, price, False),))
+    before = ingress_trace(pid)
+    r = ingress(pid, reactivate_branch_product=True)
+    assert r.status_code == 409
+    assert r.headers["X-Error-Code"] == "BRANCH_PRICE_REQUIRED_FOR_REACTIVATION"
+    assert isinstance(r.json()["detail"], str)
+    assert ingress_trace(pid) == before           # sin ingreso, lote, movimiento, auditoría ni cambios en producto
+    assert ingress_trace(pid)["ingresses"] == 0 and ingress_trace(pid)["lots"] == 0
+    assert ingress_trace(pid)["movements"] == 0
+    assert config_row(pid, 2) == {"is_available": False, "price": price}   # sigue RETIRADO, precio intacto
+    assert admin_row(2, pid)["branch_status"] == "RETIRADO"
+
+
+@pytest.mark.parametrize("price", [5000.0, 0.0, None])
+def test_retired_without_confirmation_still_returns_retired_code(price):
+    pid = make_product(configs=((2, price, False),))
+    before = ingress_trace(pid)
+    r = ingress(pid)
+    assert r.status_code == 409
+    assert r.headers["X-Error-Code"] == "PRODUCT_RETIRED_IN_BRANCH"
+    assert ingress_trace(pid) == before
+    assert config_row(pid, 2)["is_available"] is False
 
 
 def test_ingress_on_available_and_unconfigured_products_is_unchanged():

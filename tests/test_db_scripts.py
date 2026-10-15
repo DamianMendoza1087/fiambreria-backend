@@ -38,7 +38,9 @@ def build_db(path):
     conn.executescript(SCHEMA)
     conn.executemany("INSERT INTO users VALUES (?,?,?,?,?)", [
         (1, "admin@fiambreria.com", "admin123", "masteradmin", 1),
-        (2, "vende@test", "otra", "vendedor", 1)])
+        (2, "vende@test", "otra", "vendedor", 1),
+        (3, "Admin@Fiambreria.com", "x", "vendedor", 0),       # variante del email maestro
+        (4, "intruso@test", "y", "superadmin", 1)])
     conn.executemany("INSERT INTO products VALUES (?,?,?,?,?,?,?)", [
         (1, "Miel 500 ml", "Arturo", "7790000000011", 0, 1, 2000),
         (2, "Miel 500 kg", None, "7790000000011", 0, 1, 2000),   # EAN duplicado
@@ -86,6 +88,10 @@ def test_diagnostics_detects_issues_without_writing(tmp_path):
     sec = report["security"]
     assert sec["default_master_password_in_use"] is True
     assert sec["plaintext_password_storage"] is True
+    assert sec["master_email_variants"] == ["Admin@Fiambreria.com"]
+    assert {u["email"] for u in sec["admin_level_users"]} == {"admin@fiambreria.com", "intruso@test"}
+    assert sec["unknown_roles"] == []
+    assert all(set(u) == {"email", "role", "is_active"} for u in sec["admin_level_users"])
     assert "admin123" not in str(report)                      # nunca muestra contraseñas
     assert report["integrity_quick_check"] == ["ok"]
 

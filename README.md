@@ -130,3 +130,19 @@ precio propio de la sucursal > 0, validado por `_require_branch_price_for_reacti
 Retirar, reactivar y la reactivación desde un ingreso quedan en `audit_events`
 (`entity_type = 'branch_product'`). El `actor` todavía lo informa la app: es trazabilidad, no
 autenticación (eso llega en la fase de autenticación).
+
+## Parche de seguridad U1 — usuarios (previo a Fase 2.1)
+
+Todavía no hay autenticación real. Mientras tanto:
+
+- `GET /users`, `POST /users` y `PATCH /users/{id}/permissions` devuelven solo campos no sensibles
+  (`serialize_user`, lista blanca `USER_PUBLIC_FIELDS`). Nunca devuelven contraseñas.
+- `POST /users` solo crea usuarios con rol `vendedor` (inactivos, como antes). Cualquier otro rol responde 403
+  `X-Error-Code: ADMIN_OPERATION_BLOCKED_UNTIL_AUTH`. Emails duplicados (sin distinguir mayúsculas) y variantes
+  del email maestro responden 409.
+- `PATCH /users/{id}/permissions` no asigna roles `masteradmin` ni `superadmin` y no modifica usuarios con esos
+  roles; `PATCH /users/{id}/status` no habilita ni deshabilita a esos usuarios (403, mismo código).
+- Cambios entre `dueno` y `vendedor`, permisos `can_*`, sucursal y habilitar/inhabilitar empleados siguen
+  funcionando como hasta ahora.
+- `diagnose_db.py` informa cuentas administrativas, variantes del email maestro y roles desconocidos (sin
+  contraseñas) para revisar si la escalada anónima previa fue utilizada.

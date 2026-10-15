@@ -864,50 +864,97 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         "branch_id": user.branch_id or 1
     }
 
+# ===== USUARIOS: parche de seguridad U1 (previo a la autenticación real de Fase 2.1) =====
+# Todavía no hay autenticación: estos endpoints son anónimos. Por eso:
+# - nunca devuelven contraseñas ni ningún otro secreto (lista blanca de campos);
+# - las operaciones que podrían crear o modificar administradores quedan BLOQUEADAS hasta 2.1,
+#   en lugar de "protegerlas" con datos que manda el propio cliente (rol, email, actor, headers).
+
+MASTER_ADMIN_EMAIL = "admin@fiambreria.com"
+ADMIN_LEVEL_ROLES = ("masteradmin", "superadmin")
+# Roles que un pedido anónimo puede asignar mientras no exista autenticación real.
+ANONYMOUS_ASSIGNABLE_ROLES = ("dueno", "vendedor")
+ERROR_ADMIN_OPERATION_BLOCKED = "ADMIN_OPERATION_BLOCKED_UNTIL_AUTH"
+
+# Único formato de salida de un usuario. Cualquier campo nuevo de UserDB (hash, token, etc.)
+# queda fuera hasta que se agregue acá explícitamente.
+USER_PUBLIC_FIELDS = (
+    "id", "name", "email", "role", "is_active", "branch_id",
+    "can_preventa", "can_caja", "can_stock", "can_ingreso", "can_alertas", "can_rrhh",
+    "can_mrp", "can_verificacion", "can_kpis", "can_carteleria", "can_edit_records",
+)
+
+
+def serialize_user(u: UserDB) -> dict:
+    return {field: getattr(u, field) for field in USER_PUBLIC_FIELDS}
+
+
+def _is_admin_level_user(u: UserDB) -> bool:
+    return (u.role or "") in ADMIN_LEVEL_ROLES or (u.email or "").strip().lower() == MASTER_ADMIN_EMAIL
+
+
+def _admin_operation_blocked(detail: str) -> HTTPException:
+    return _coded_error(403, ERROR_ADMIN_OPERATION_BLOCKED,
+                        detail + " Esta operación se habilita con el inicio de sesión real (Fase 2.1).")
+
+
 @app.get("/users")
 def get_users(db: Session = Depends(get_db)):
-    return db.query(UserDB).all()
+    return [serialize_user(u) for u in db.query(UserDB).all()]
 
 @app.post("/users")
 def create_user(user_data: dict, db: Session = Depends(get_db)):
-    role = user_data.get("role", "vendedor")
+    name = str(user_data.get("name") or "").strip()
+    email = str(user_data.get("email") or "").strip()
+    password = user_data.get("password")
+    if not name or not email or not isinstance(password, str) or not password:
+        raise HTTPException(status_code=422, detail="Nombre, email y contraseña son obligatorios")
+
+    # Sin autenticación, un pedido anónimo solo puede crear empleados (rol vendedor).
+    role = user_data.get("role")
+    role = "vendedor" if role is None or str(role).strip() == "" else str(role).strip()
+    if role != "vendedor":
+        raise _admin_operation_blocked("No se pueden crear usuarios con rol administrativo.")
+
+    # Emails únicos sin distinguir mayúsculas: evita, entre otras cosas, una variante del email
+    # de la cuenta maestra (el login la promueve a masteradmin comparando en minúsculas).
+    lowered = email.lower()
+    if lowered == MASTER_ADMIN_EMAIL or db.query(UserDB).filter(func.lower(UserDB.email) == lowered).first():
+        raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
+
     new_u = UserDB(
-        name=user_data["name"],
-        email=user_data["email"],
-        hashed_password=user_data["password"],
+        name=name,
+        email=email,
+        hashed_password=password,
         role=role,
         is_active=False,
         can_preventa=True, can_caja=False, can_stock=False, can_ingreso=False,
         can_alertas=False, can_rrhh=False, can_mrp=False, can_verificacion=False, can_kpis=False,
-        can_carteleria=bool(user_data.get("can_carteleria", role in ["superadmin", "dueno"])),
-        can_edit_records=(role in ["superadmin", "dueno"]),
+        can_carteleria=bool(user_data.get("can_carteleria", False)),
+        can_edit_records=False,
         branch_id=int(user_data.get("branch_id", 1) or 1)
     )
     db.add(new_u); db.commit(); db.refresh(new_u)
-    return new_u
+    return serialize_user(new_u)
 
 @app.patch("/users/{user_id}/permissions")
 def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends(get_db)):
     u=db.query(UserDB).filter(UserDB.id==user_id).first()
     if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
 
-    if u.email.lower() == "admin@fiambreria.com":
-        if p.role is not None and p.role != "masteradmin":
-            raise HTTPException(status_code=403, detail="El Admin Maestro no puede ser degradado")
-        if p.is_active is False:
-            raise HTTPException(status_code=403, detail="El Admin Maestro no puede ser deshabilitado")
-        u.role = "masteradmin"
-        u.is_active = True
-        u.can_edit_records = True
-        u.can_carteleria = True
+    # Ningún pedido anónimo modifica a un MASTERADMIN o SUPERADMIN (rol, estado, permisos ni sucursal).
+    if _is_admin_level_user(u):
+        raise _admin_operation_blocked("No se pueden modificar usuarios MASTERADMIN o SUPERADMIN.")
 
-    if p.role is not None and u.email.lower() != "admin@fiambreria.com":
-        if p.role not in ("superadmin", "dueno", "vendedor"):
+    if p.role is not None:
+        if p.role in ADMIN_LEVEL_ROLES:
+            raise _admin_operation_blocked("No se puede asignar un rol administrativo.")
+        if p.role not in ANONYMOUS_ASSIGNABLE_ROLES:
             raise HTTPException(status_code=400, detail="Rol invalido")
-        u.role=p.role
-        if p.role=="superadmin":
-            u.can_edit_records=True
-            u.can_carteleria=True
+    if p.branch_id is not None and p.branch_id not in (1, 2):
+        raise HTTPException(status_code=400, detail="Sucursal invalida")
+
+    if p.role is not None: u.role=p.role
     if p.is_active is not None: u.is_active=p.is_active
     if p.can_preventa is not None: u.can_preventa=p.can_preventa
     if p.can_caja is not None: u.can_caja=p.can_caja
@@ -920,18 +967,15 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
     if p.can_kpis is not None: u.can_kpis=p.can_kpis
     if p.can_carteleria is not None: u.can_carteleria=p.can_carteleria
     if p.can_edit_records is not None: u.can_edit_records=p.can_edit_records
-    if p.branch_id is not None:
-        if p.branch_id not in (1, 2):
-            raise HTTPException(status_code=400, detail="Sucursal invalida")
-        u.branch_id=p.branch_id
-    db.commit(); db.refresh(u); return u
+    if p.branch_id is not None: u.branch_id=p.branch_id
+    db.commit(); db.refresh(u); return serialize_user(u)
 
 @app.patch("/users/{user_id}/status")
 def update_user_status(user_id: int, payload: UserStatusSchema, db: Session=Depends(get_db)):
     u=db.query(UserDB).filter(UserDB.id==user_id).first()
     if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
-    if u.email.lower() == "admin@fiambreria.com" and not payload.is_active:
-        raise HTTPException(status_code=403, detail="El Admin Maestro no puede ser deshabilitado")
+    if _is_admin_level_user(u):
+        raise _admin_operation_blocked("No se puede habilitar ni deshabilitar a un MASTERADMIN o SUPERADMIN.")
     u.is_active=payload.is_active
     db.commit()
     return {"status":"success","user_id":u.id,"is_active":u.is_active}

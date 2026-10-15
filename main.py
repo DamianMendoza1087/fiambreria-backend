@@ -524,7 +524,17 @@ def ensure_fair_live_schema():
 ensure_fair_live_schema()
 
 app = FastAPI(title="Fiambrería POS, RRHH, MRP, KPIs & Permisos API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
+                   expose_headers=["X-Error-Code"])
+
+# Código de error legible por la app en el header X-Error-Code; el "detail" sigue siendo un texto
+# para que las versiones anteriores de la app muestren un mensaje claro.
+ERROR_RETIRE_REQUIRES_CONFIRMATION = "RETIRE_REQUIRES_CONFIRMATION"
+ERROR_PRODUCT_RETIRED_IN_BRANCH = "PRODUCT_RETIRED_IN_BRANCH"
+
+
+def _coded_error(status_code: int, code: str, detail: str) -> HTTPException:
+    return HTTPException(status_code=status_code, detail=detail, headers={"X-Error-Code": code})
 
 def get_db():
     db = SessionLocal()
@@ -746,6 +756,12 @@ class IngressCreateSchema(BaseModel):
     expiration_date: Optional[str] = None
     received_by: Optional[str] = "Anonimo"
     notes: Optional[str] = None
+    # Un ingreso sobre un producto RETIRADO de la sucursal solo lo reactiva con confirmación explícita.
+    reactivate_branch_product: Optional[bool] = False
+
+class BranchProductActionSchema(BaseModel):
+    actor: Optional[str] = None
+    reason: Optional[str] = None
 
 class CashOpenSchema(BaseModel):
     initial_amount: float
@@ -1262,11 +1278,81 @@ def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
             "stock": get_branch_stock(db, product.id, branch_id),
             "is_available": bool(config.is_available) if config else False,
             "is_exclusive": bool(config.is_exclusive) if config else False,
+            "branch_status": _branch_status(config),
             "branch_id": branch_id
         })
 
     db.commit()
     return result
+
+
+BRANCH_STATUS_AVAILABLE = "DISPONIBLE"
+BRANCH_STATUS_RETIRED = "RETIRADO"
+BRANCH_STATUS_NOT_ENABLED = "NO_HABILITADO"
+
+
+def _branch_status(config) -> str:
+    """DISPONIBLE / RETIRADO (configurado y deshabilitado en la sucursal) / NO_HABILITADO (nunca configurado)."""
+    if config is None:
+        return BRANCH_STATUS_NOT_ENABLED
+    return BRANCH_STATUS_AVAILABLE if config.is_available else BRANCH_STATUS_RETIRED
+
+
+def _branch_stock_detail(db: Session, product_id: int, branch_id: int) -> dict:
+    """Stock de la sucursal según sus partidas y su valor a costo histórico de cada partida.
+
+    El valor es confiable solo si todas las partidas con saldo tienen costo > 0.
+    """
+    lots = db.query(ProductLotDB).filter(
+        ProductLotDB.product_id == product_id,
+        ProductLotDB.branch_id == branch_id,
+        ProductLotDB.current_qty > 0
+    ).all()
+    qty = sum(float(l.current_qty or 0) for l in lots)
+    value = sum(float(l.current_qty or 0) * float(l.cost_price or 0) for l in lots)
+    reliable = all(float(l.cost_price or 0) > 0 for l in lots)
+    return {
+        "stock": round(qty, 6),
+        "stock_value_at_cost": round(value, 2) if lots and reliable else None,
+        "cost_reliable": reliable,
+        "lots_with_stock": len(lots),
+    }
+
+
+def _get_active_branch_or_404(db: Session, branch_id: int) -> BranchDB:
+    branch = db.query(BranchDB).filter(BranchDB.id == branch_id, BranchDB.is_active == True).first()
+    if not branch:
+        raise HTTPException(status_code=404, detail="Sucursal no encontrada")
+    return branch
+
+
+def _format_qty(qty: float, unit_type: Optional[str]) -> str:
+    text_qty = f"{qty:.3f}".rstrip("0").rstrip(".")
+    return f"{text_qty} {unit_type or 'unid'}"
+
+
+@app.get("/branches/{branch_id}/products/{product_id}/retire-preview")
+def preview_retire_branch_product(branch_id: int, product_id: int, db: Session = Depends(get_db)):
+    """Qué pasaría al retirar el producto de la sucursal (no modifica nada)."""
+    branch = _get_active_branch_or_404(db, branch_id)
+    product = db.query(ProductDB).filter(ProductDB.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado")
+    config = db.query(BranchProductDB).filter(
+        BranchProductDB.branch_id == branch_id,
+        BranchProductDB.product_id == product_id
+    ).first()
+    detail = _branch_stock_detail(db, product_id, branch_id)
+    return {
+        "branch_id": branch_id,
+        "branch_name": branch.name,
+        "product_id": product.id,
+        "product_name": product.name,
+        "unit_type": product.unit_type,
+        "branch_status": _branch_status(config),
+        "requires_confirmation": detail["stock"] > 0.000001,
+        **detail,
+    }
 
 @app.put("/branches/{branch_id}/products/{product_id}")
 def configure_branch_product(
@@ -1334,8 +1420,17 @@ def configure_branch_product(
 def remove_product_from_branch(
     branch_id: int,
     product_id: int,
+    confirm_stock: bool = False,
+    actor: Optional[str] = None,
+    reason: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
+    """Retirar de sucursal: solo is_available=false en ESA sucursal.
+
+    No borra el producto maestro, ni partidas, ni movimientos, ni historial. Si la sucursal
+    tiene stock del producto exige confirm_stock=true (el stock queda inmovilizado, no se vende).
+    """
+    branch = _get_active_branch_or_404(db, branch_id)
     config = db.query(BranchProductDB).filter(
         BranchProductDB.branch_id == branch_id,
         BranchProductDB.product_id == product_id
@@ -1347,15 +1442,94 @@ def remove_product_from_branch(
             detail="Producto no configurado en esta sucursal"
         )
 
+    product = db.query(ProductDB).filter(ProductDB.id == product_id).first()
+    detail = _branch_stock_detail(db, product_id, branch_id)
+
+    if not config.is_available:
+        return {
+            "status": "success",
+            "already_retired": True,
+            "branch_id": branch_id,
+            "product_id": product_id,
+            "is_available": False,
+            "branch_status": BRANCH_STATUS_RETIRED,
+            **detail
+        }
+
+    if detail["stock"] > 0.000001 and not confirm_stock:
+        name = product.name if product else f"Producto {product_id}"
+        value_text = (f" (valor a costo ${detail['stock_value_at_cost']:.2f})"
+                      if detail["stock_value_at_cost"] is not None else "")
+        raise _coded_error(
+            409, ERROR_RETIRE_REQUIRES_CONFIRMATION,
+            f"{name} tiene {_format_qty(detail['stock'], product.unit_type if product else None)} en stock "
+            f"en {branch.name}{value_text}. Si lo retirás, ese stock queda sin vender hasta reactivarlo. "
+            "Confirmá para retirarlo."
+        )
+
     config.is_available = False
+    note = (reason or "").strip() or "Retirar de sucursal"
+    if detail["stock"] > 0.000001:
+        note += f" | stock al retirar: {detail['stock']}"
+    db.add(AuditEventDB(
+        entity_type="branch_product", entity_id=config.id,
+        field_name=f"is_available_branch_{branch_id}_product_{product_id}",
+        old_value="True", new_value="False",
+        actor=(actor or "").strip() or "Anonimo", reason=note
+    ))
     db.commit()
 
     return {
         "status": "success",
+        "already_retired": False,
         "branch_id": branch_id,
         "product_id": product_id,
-        "is_available": False
+        "is_available": False,
+        "branch_status": BRANCH_STATUS_RETIRED,
+        **detail
     }
+
+
+@app.post("/branches/{branch_id}/products/{product_id}/reactivate")
+def reactivate_branch_product(
+    branch_id: int,
+    product_id: int,
+    payload: Optional[BranchProductActionSchema] = None,
+    db: Session = Depends(get_db)
+):
+    """Vuelve a habilitar en la sucursal un producto RETIRADO, con su precio de sucursal ya configurado."""
+    _get_active_branch_or_404(db, branch_id)
+    product = db.query(ProductDB).filter(ProductDB.id == product_id, ProductDB.is_active == True).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Producto no encontrado o inactivo")
+    config = db.query(BranchProductDB).filter(
+        BranchProductDB.branch_id == branch_id,
+        BranchProductDB.product_id == product_id
+    ).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="Producto no configurado en esta sucursal")
+
+    if config.is_available:
+        return {"status": "success", "already_available": True, "branch_id": branch_id,
+                "product_id": product_id, "is_available": True, "branch_status": BRANCH_STATUS_AVAILABLE,
+                "price_per_unit": config.price_per_unit}
+
+    # El precio de venta debe ser explícito en la sucursal: no se reactiva con precio vacío o 0.
+    if config.price_per_unit is None or config.price_per_unit <= 0:
+        raise HTTPException(status_code=409, detail="Configurá un precio de venta mayor a 0 para esta sucursal antes de reactivar el producto")
+
+    config.is_available = True
+    actor = ((payload.actor if payload else None) or "").strip() or "Anonimo"
+    reason = ((payload.reason if payload else None) or "").strip() or "Reactivar en sucursal"
+    db.add(AuditEventDB(
+        entity_type="branch_product", entity_id=config.id,
+        field_name=f"is_available_branch_{branch_id}_product_{product_id}",
+        old_value="False", new_value="True", actor=actor, reason=reason
+    ))
+    db.commit()
+    return {"status": "success", "already_available": False, "branch_id": branch_id,
+            "product_id": product_id, "is_available": True, "branch_status": BRANCH_STATUS_AVAILABLE,
+            "price_per_unit": config.price_per_unit, "stock": get_branch_stock(db, product_id, branch_id)}
 
 @app.post("/products/master")
 def create_product_master(
@@ -1822,7 +1996,21 @@ def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session
         db.add(config)
         db.flush()
     elif not config.is_available:
+        # Producto RETIRADO de esta sucursal: nunca se reactiva en silencio.
+        if not payload.reactivate_branch_product:
+            raise _coded_error(
+                409, ERROR_PRODUCT_RETIRED_IN_BRANCH,
+                f"{product.name} está retirado de {branch.name}. Confirmá que querés reactivarlo "
+                "para registrar este ingreso, o reactivalo desde Stock."
+            )
         config.is_available = True
+        db.add(AuditEventDB(
+            entity_type="branch_product", entity_id=config.id,
+            field_name=f"is_available_branch_{branch_id}_product_{product.id}",
+            old_value="False", new_value="True",
+            actor=payload.received_by or "Anonimo",
+            reason="Reactivado al registrar ingreso (confirmado)"
+        ))
 
     ing,lot=register_ingress(product,payload.supplier,payload.cost_price,payload.quantity,payload.lot_number,payload.expiration_date,payload.received_by,payload.notes,db,branch_id)
     db.commit(); db.refresh(ing)

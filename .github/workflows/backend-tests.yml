@@ -1,0 +1,68 @@
+# CI del backend: ejecuta la suite completa de pytest sobre una base SQLite TEMPORAL.
+#
+# - No usa secretos, ni DATABASE_URL de Render, ni el disco /var/data: los tests crean sus
+#   propias bases en directorios temporales (ver tests/test_day_plans_api.py y test_db_config.py).
+# - No despliega, no hace merge y no escribe en el repositorio (permisos de solo lectura).
+# - Python: el repo no fija versión; Render usa 3.14.x por defecto para servicios creados desde
+#   2026-02-11 salvo que PYTHON_VERSION diga otra cosa. Se prueba 3.14 y 3.13.
+name: Backend tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configurar Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Instalar dependencias (proyecto + tests)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip freeze
+
+      - name: Verificar que no hay configuración de producción
+        run: |
+          test -z "${DATABASE_URL:-}" || { echo "DATABASE_URL no debe estar definida en CI"; exit 1; }
+          test -z "${APP_ENV:-}" || { echo "APP_ENV no debe estar definida en CI"; exit 1; }
+          test ! -e /var/data/fiambreria.db || { echo "No debe existir una base en /var/data"; exit 1; }
+
+      - name: Ejecutar suite completa
+        run: python -m pytest tests -v -rA --durations=15 --junitxml=pytest-report.xml
+
+      - name: Guardar reporte
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report-py${{ matrix.python-version }}
+          path: pytest-report.xml
+          if-no-files-found: ignore

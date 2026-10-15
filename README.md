@@ -120,6 +120,12 @@ Endpoints:
   Con esa confirmación aplica la MISMA regla de precio que `/reactivate`: sin precio de sucursal > 0
   responde `BRANCH_PRICE_REQUIRED_FOR_REACTIVATION` y no registra ingreso, partida, movimiento ni
   cambio de disponibilidad. El listado de administración agrega `branch_price_configured`.
+- `PUT /branches/{b}/products/{p}`: si pasa un producto RETIRADO a `is_available: true` aplica la misma
+  regla (precio enviado en el PUT o, si no se envía, el propio ya configurado; nunca el global). Si se
+  rechaza no cambia nada. Cambios que mantienen el producto retirado siguen permitidos.
+
+Regla única en backend para todos los caminos RETIRADO -> DISPONIBLE (`/reactivate`, Ingresos y `PUT`):
+precio propio de la sucursal > 0, validado por `_require_branch_price_for_reactivation`.
 
 Retirar, reactivar y la reactivación desde un ingreso quedan en `audit_events`
 (`entity_type = 'branch_product'`). El `actor` todavía lo informa la app: es trazabilidad, no

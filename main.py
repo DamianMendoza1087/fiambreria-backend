@@ -1329,12 +1329,12 @@ def _get_active_branch_or_404(db: Session, branch_id: int) -> BranchDB:
     return branch
 
 
-def _require_branch_price_for_reactivation(config, product_name: str, branch_name: str):
-    """Regla única: un producto RETIRADO solo vuelve a DISPONIBLE con precio de sucursal propio > 0.
+def _require_branch_price_for_reactivation(price: Optional[float], product_name: str, branch_name: str):
+    """Regla única para TODOS los caminos RETIRADO -> DISPONIBLE (reactivar, ingreso, configuración).
 
-    Nunca usa products.price_per_unit como respaldo. Se llama ANTES de modificar nada.
+    `price` es el precio PROPIO de la sucursal que quedaría vigente. Nunca se resuelve con
+    products.price_per_unit. Se llama ANTES de modificar nada.
     """
-    price = config.price_per_unit if config is not None else None
     if price is None or price <= 0:
         raise _coded_error(
             409, ERROR_BRANCH_PRICE_REQUIRED,
@@ -1402,6 +1402,14 @@ def configure_branch_product(
         BranchProductDB.product_id == product_id
     ).first()
 
+    # RETIRADO -> DISPONIBLE: misma regla que /reactivate e Ingresos, validada antes de modificar nada.
+    # El precio que valida es el propio de la sucursal: el enviado en este PUT o, si no se envía,
+    # el ya configurado en la sucursal. Nunca el precio global.
+    reactivating = config is not None and not config.is_available and payload.is_available
+    if reactivating:
+        own_price = payload.price_per_unit if payload.price_per_unit is not None else config.price_per_unit
+        _require_branch_price_for_reactivation(own_price, product.name, branch.name)
+
     if not config:
         config = BranchProductDB(
             branch_id=branch_id,
@@ -1409,15 +1417,29 @@ def configure_branch_product(
         )
         db.add(config)
 
-    config.price_per_unit = (
-        payload.price_per_unit
-        if payload.price_per_unit is not None
-        else product.price_per_unit
-    )
+    if reactivating:
+        # Conserva el precio propio validado arriba; no lo reemplaza por el global.
+        if payload.price_per_unit is not None:
+            config.price_per_unit = payload.price_per_unit
+    else:
+        # Comportamiento previo (sin cambios para disponibles, retirados que siguen retirados
+        # y productos nunca configurados).
+        config.price_per_unit = (
+            payload.price_per_unit
+            if payload.price_per_unit is not None
+            else product.price_per_unit
+        )
     if payload.minimum_stock is not None:
         config.minimum_stock = payload.minimum_stock
     config.is_available = payload.is_available
     config.is_exclusive = payload.is_exclusive
+    if reactivating:
+        db.add(AuditEventDB(
+            entity_type="branch_product", entity_id=config.id,
+            field_name=f"is_available_branch_{branch_id}_product_{product_id}",
+            old_value="False", new_value="True", actor="Anonimo",
+            reason="Reactivado desde configuración de sucursal (PUT)"
+        ))
 
     db.commit()
     db.refresh(config)
@@ -1532,7 +1554,7 @@ def reactivate_branch_product(
                 "price_per_unit": config.price_per_unit}
 
     # El precio de venta debe ser explícito en la sucursal: no se reactiva con precio vacío o 0.
-    _require_branch_price_for_reactivation(config, product.name, branch.name)
+    _require_branch_price_for_reactivation(config.price_per_unit, product.name, branch.name)
 
     config.is_available = True
     actor = ((payload.actor if payload else None) or "").strip() or "Anonimo"
@@ -2021,7 +2043,7 @@ def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session
             )
         # Misma regla que /reactivate. Se valida antes de tocar disponibilidad, lotes, ingreso o
         # movimientos: si falla, no queda nada registrado.
-        _require_branch_price_for_reactivation(config, product.name, branch.name)
+        _require_branch_price_for_reactivation(config.price_per_unit, product.name, branch.name)
         config.is_available = True
         db.add(AuditEventDB(
             entity_type="branch_product", entity_id=config.id,

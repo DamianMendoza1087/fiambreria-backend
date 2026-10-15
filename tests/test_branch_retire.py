@@ -301,3 +301,89 @@ def test_ingress_on_available_and_unconfigured_products_is_unchanged():
     assert ingress(unconfigured).status_code == 200       # comportamiento previo: lo habilita
     assert config_row(unconfigured, 2)["is_available"] is True
     assert audit_rows(available) == [] and audit_rows(unconfigured) == []
+
+
+# --- PUT /branches/{b}/products/{p}: misma regla RETIRADO -> DISPONIBLE ------------------------
+
+def config_full(product_id, branch_id):
+    db = main.SessionLocal()
+    row = db.query(main.BranchProductDB).filter_by(product_id=product_id, branch_id=branch_id).first()
+    data = None if row is None else {"is_available": bool(row.is_available), "price": row.price_per_unit,
+                                     "minimum_stock": row.minimum_stock, "is_exclusive": bool(row.is_exclusive)}
+    db.close()
+    return data
+
+
+def put_config(branch_id, product_id, **payload):
+    return client.put(f"/branches/{branch_id}/products/{product_id}", json=payload)
+
+
+def retired_product(price):
+    """Producto RETIRADO en Feria con stock mínimo 2; el precio global es 4000 (make_product)."""
+    pid = make_product(configs=((2, price, False),))
+    db = main.SessionLocal()
+    db.query(main.BranchProductDB).filter_by(product_id=pid, branch_id=2).update({"minimum_stock": 2.0})
+    db.commit()
+    db.close()
+    return pid
+
+
+def test_put_reactivation_with_valid_new_price_succeeds():
+    pid = retired_product(5000.0)
+    r = put_config(2, pid, price_per_unit=6000, is_available=True, is_exclusive=False)
+    assert r.status_code == 200, r.text
+    assert config_full(pid, 2) == {"is_available": True, "price": 6000.0, "minimum_stock": 2.0,
+                                   "is_exclusive": False}
+    assert audit_rows(pid)[-1][:2] == ("False", "True")
+    assert any(p["id"] == pid and p["price_per_unit"] == 6000.0
+               for p in client.get("/products?branch_id=2").json())
+
+
+def test_put_reactivation_without_price_uses_own_branch_price_never_global():
+    pid = retired_product(5000.0)
+    r = put_config(2, pid, is_available=True)
+    assert r.status_code == 200, r.text
+    assert config_full(pid, 2)["price"] == 5000.0          # conserva el propio; no lo pisa con el global 4000
+    assert config_full(pid, 2)["is_available"] is True
+
+
+@pytest.mark.parametrize("stored_price,sent", [
+    (5000.0, {"price_per_unit": 0}),          # precio enviado = 0 (aunque la sucursal tenía 5000)
+    (None, {"price_per_unit": None}),         # NULL explícito y sin precio propio
+    (None, {}),                               # sin precio enviado ni propio: no usa el global 4000
+    (0.0, {}),                                # precio propio 0: no usa el global 4000
+])
+def test_put_reactivation_without_valid_own_price_is_rejected_without_changes(stored_price, sent):
+    pid = retired_product(stored_price)
+    before = config_full(pid, 2)
+    r = put_config(2, pid, is_available=True, minimum_stock=9, is_exclusive=True, **sent)
+    assert r.status_code == 409
+    assert r.headers["X-Error-Code"] == "BRANCH_PRICE_REQUIRED_FOR_REACTIVATION"
+    assert isinstance(r.json()["detail"], str)
+    assert config_full(pid, 2) == before                   # ni disponibilidad, ni precio, ni mínimo, ni exclusivo
+    assert before["is_available"] is False
+    assert audit_rows(pid) == []
+    assert all(p["id"] != pid for p in client.get("/products?branch_id=2").json())
+
+
+def test_put_on_retired_product_that_stays_retired_is_allowed():
+    pid = retired_product(None)
+    r = put_config(2, pid, price_per_unit=7000, minimum_stock=3, is_available=False, is_exclusive=False)
+    assert r.status_code == 200, r.text
+    assert config_full(pid, 2) == {"is_available": False, "price": 7000.0, "minimum_stock": 3.0,
+                                   "is_exclusive": False}
+    assert audit_rows(pid) == []
+    # Con el precio ya cargado, ahora sí puede reactivarse.
+    assert client.post(f"/branches/2/products/{pid}/reactivate", json={}).status_code == 200
+
+
+def test_put_keeps_previous_behavior_for_available_and_never_configured_products():
+    available = make_product("Disponible")
+    r = put_config(2, available, minimum_stock=1, is_available=True)
+    assert r.status_code == 200
+    assert config_full(available, 2)["price"] == 4000.0    # comportamiento previo, fuera del alcance de Fase 1
+    never = make_product("Nunca configurado", configs=())
+    r = put_config(2, never, is_available=True)
+    assert r.status_code == 200
+    assert config_full(never, 2) == {"is_available": True, "price": 4000.0, "minimum_stock": None,
+                                     "is_exclusive": False}

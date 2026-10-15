@@ -92,3 +92,41 @@ Endpoints:
 `actor` debe ser un usuario activo con rol masteradmin, superadmin o dueno. **Es una
 validación de coherencia, no autenticación**: el backend todavía no verifica tokens.
 No hay apertura ni cierre automáticos; si sigue abierta después de `end_date` se advierte.
+
+## Fase 1 — Retirar / Reactivar por sucursal, backup y diagnóstico
+
+Sin cambios de esquema (no agrega tablas ni columnas).
+
+Antes de desplegar, desde el Shell del servicio en Render:
+
+    python backup_db.py --label pre-fase1   # copia verificada en /var/data/backups/ (nunca sobrescribe ni borra)
+    python diagnose_db.py                   # SOLO LECTURA: duplicados, stock retirado, ventas inconsistentes, etc.
+
+Ninguno de los dos importa `main.py`: no crean ni modifican tablas. `diagnose_db.py` abre la base con
+`mode=ro` y nunca muestra contraseñas (solo informa si la cuenta maestra usa la clave por defecto).
+
+Endpoints:
+
+- `GET /branches/{b}/products` agrega `branch_status`: `DISPONIBLE`, `RETIRADO` o `NO_HABILITADO`.
+- `GET /branches/{b}/products/{p}/retire-preview`: stock de la sucursal, valor a costo (si todas las
+  partidas con saldo tienen costo) y si hace falta confirmar. No modifica nada.
+- `DELETE /branches/{b}/products/{p}?confirm_stock=true&actor=...&reason=...`: retira solo en esa
+  sucursal (`is_available=false`). No borra producto maestro, partidas ni historial. Con stock y sin
+  `confirm_stock=true` responde 409 con header `X-Error-Code: RETIRE_REQUIRES_CONFIRMATION`.
+- `POST /branches/{b}/products/{p}/reactivate` `{actor, reason}`: exige precio de sucursal > 0
+  (409 `X-Error-Code: BRANCH_PRICE_REQUIRED_FOR_REACTIVATION`; nunca usa el precio global).
+- `POST /ingresses`: si el producto está RETIRADO en la sucursal responde 409
+  (`X-Error-Code: PRODUCT_RETIRED_IN_BRANCH`) salvo `reactivate_branch_product: true`.
+  Con esa confirmación aplica la MISMA regla de precio que `/reactivate`: sin precio de sucursal > 0
+  responde `BRANCH_PRICE_REQUIRED_FOR_REACTIVATION` y no registra ingreso, partida, movimiento ni
+  cambio de disponibilidad. El listado de administración agrega `branch_price_configured`.
+- `PUT /branches/{b}/products/{p}`: si pasa un producto RETIRADO a `is_available: true` aplica la misma
+  regla (precio enviado en el PUT o, si no se envía, el propio ya configurado; nunca el global). Si se
+  rechaza no cambia nada. Cambios que mantienen el producto retirado siguen permitidos.
+
+Regla única en backend para todos los caminos RETIRADO -> DISPONIBLE (`/reactivate`, Ingresos y `PUT`):
+precio propio de la sucursal > 0, validado por `_require_branch_price_for_reactivation`.
+
+Retirar, reactivar y la reactivación desde un ingreso quedan en `audit_events`
+(`entity_type = 'branch_product'`). El `actor` todavía lo informa la app: es trazabilidad, no
+autenticación (eso llega en la fase de autenticación).

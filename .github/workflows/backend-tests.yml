@@ -1,0 +1,106 @@
+# CI del backend: ejecuta la suite completa de pytest sobre una base SQLite TEMPORAL.
+#
+# - No usa secretos, ni DATABASE_URL de Render, ni el disco /var/data: los tests crean sus
+#   propias bases en directorios temporales (ver tests/test_day_plans_api.py y test_db_config.py).
+# - No despliega, no hace merge y no escribe en el repositorio (permisos de solo lectura).
+# - Python: el repo no fija versión; Render usa 3.14.x por defecto para servicios creados desde
+#   2026-02-11 salvo que PYTHON_VERSION diga otra cosa. Se prueba 3.14 y 3.13.
+name: Backend tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14", "3.13"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configurar Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Instalar dependencias (proyecto + tests)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip freeze
+
+      - name: Verificar que no hay configuración de producción
+        run: |
+          test -z "${DATABASE_URL:-}" || { echo "DATABASE_URL no debe estar definida en CI"; exit 1; }
+          test -z "${APP_ENV:-}" || { echo "APP_ENV no debe estar definida en CI"; exit 1; }
+          test ! -e /var/data/fiambreria.db || { echo "No debe existir una base en /var/data"; exit 1; }
+
+      - name: Ejecutar suite completa
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest tests -v -rA --durations=15 --junitxml=pytest-report.xml 2>&1 | tee pytest-output.txt
+
+      # Publica totales, fallas y warnings de pytest como anotaciones del job y en el resumen de la ejecución.
+      - name: Resumen de pytest
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, re, xml.etree.ElementTree as ET
+          def enc(s): return s.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          ver = "${{ matrix.python-version }}"
+          out = open("pytest-output.txt", encoding="utf-8", errors="replace").read() if os.path.exists("pytest-output.txt") else ""
+          lines = []
+          if os.path.exists("pytest-report.xml"):
+              root = ET.parse("pytest-report.xml").getroot()
+              s = root if root.tag == "testsuite" else root.find("testsuite")
+              total, fail, err, skip = (int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped"))
+              lines.append(f"Python {ver}: {total} tests, {total - fail - err - skip} pasaron, {fail} fallaron, "
+                           f"{err} errores, {skip} omitidos, {float(s.get('time', 0)):.1f} s")
+              for case in s.iter("testcase"):
+                  for tag in ("failure", "error"):
+                      node = case.find(tag)
+                      if node is not None:
+                          lines.append(f"{tag.upper()} {case.get('classname')}::{case.get('name')}: {(node.get('message') or '')[:300]}")
+          final = [l for l in out.splitlines() if re.match(r"^=+ .*(passed|failed|error).* in [0-9.]+s", l)]
+          if final: lines.append("pytest: " + final[-1].strip("= "))
+          m = re.search(r"=+ warnings summary =+\n(.*?)\n(?:-- Docs:.*\n)?=+", out, re.S)
+          warnings = m.group(1).strip() if m else "Sin warnings de pytest."
+          print(f"::notice title=pytest Python {ver}::{enc(chr(10).join(lines) or 'Sin reporte')}")
+          print(f"::notice title=pytest warnings Python {ver}::{enc(warnings[:6000])}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(f"### pytest — Python {ver}\n\n" + "\n".join(f"- {l}" for l in lines) +
+                      f"\n\n<details><summary>Warnings</summary>\n\n```\n{warnings[:20000]}\n```\n</details>\n")
+          PY
+
+      - name: Guardar reporte
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report-py${{ matrix.python-version }}
+          path: |
+            pytest-report.xml
+            pytest-output.txt
+          if-no-files-found: ignore

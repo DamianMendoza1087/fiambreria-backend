@@ -57,12 +57,50 @@ jobs:
           test ! -e /var/data/fiambreria.db || { echo "No debe existir una base en /var/data"; exit 1; }
 
       - name: Ejecutar suite completa
-        run: python -m pytest tests -v -rA --durations=15 --junitxml=pytest-report.xml
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest tests -v -rA --durations=15 --junitxml=pytest-report.xml 2>&1 | tee pytest-output.txt
+
+      # Publica totales, fallas y warnings de pytest como anotaciones del job y en el resumen de la ejecución.
+      - name: Resumen de pytest
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, re, xml.etree.ElementTree as ET
+          def enc(s): return s.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+          ver = "${{ matrix.python-version }}"
+          out = open("pytest-output.txt", encoding="utf-8", errors="replace").read() if os.path.exists("pytest-output.txt") else ""
+          lines = []
+          if os.path.exists("pytest-report.xml"):
+              root = ET.parse("pytest-report.xml").getroot()
+              s = root if root.tag == "testsuite" else root.find("testsuite")
+              total, fail, err, skip = (int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped"))
+              lines.append(f"Python {ver}: {total} tests, {total - fail - err - skip} pasaron, {fail} fallaron, "
+                           f"{err} errores, {skip} omitidos, {float(s.get('time', 0)):.1f} s")
+              for case in s.iter("testcase"):
+                  for tag in ("failure", "error"):
+                      node = case.find(tag)
+                      if node is not None:
+                          lines.append(f"{tag.upper()} {case.get('classname')}::{case.get('name')}: {(node.get('message') or '')[:300]}")
+          final = [l for l in out.splitlines() if re.match(r"^=+ .*(passed|failed|error).* in [0-9.]+s", l)]
+          if final: lines.append("pytest: " + final[-1].strip("= "))
+          m = re.search(r"=+ warnings summary =+\n(.*?)\n(?:-- Docs:.*\n)?=+", out, re.S)
+          warnings = m.group(1).strip() if m else "Sin warnings de pytest."
+          print(f"::notice title=pytest Python {ver}::{enc(chr(10).join(lines) or 'Sin reporte')}")
+          print(f"::notice title=pytest warnings Python {ver}::{enc(warnings[:6000])}")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
+              f.write(f"### pytest — Python {ver}\n\n" + "\n".join(f"- {l}" for l in lines) +
+                      f"\n\n<details><summary>Warnings</summary>\n\n```\n{warnings[:20000]}\n```\n</details>\n")
+          PY
 
       - name: Guardar reporte
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pytest-report-py${{ matrix.python-version }}
-          path: pytest-report.xml
+          path: |
+            pytest-report.xml
+            pytest-output.txt
           if-no-files-found: ignore

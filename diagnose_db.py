@@ -153,6 +153,17 @@ def run_diagnostics(db_path, limit=EXAMPLES_LIMIT):
                     (u["email"] or "").lower() == MASTER_EMAIL and u["hashed_password"] == DEFAULT_MASTER_PASSWORD
                     for u in users),
                 "roles": {r: sum(1 for u in users if u["role"] == r) for r in sorted({u["role"] for u in users})},
+                # Para revisar si alguien usó la escalada anónima previa al parche U1: cuentas
+                # administrativas (sin contraseñas) y variantes del email maestro con otras mayúsculas.
+                "admin_level_users": [
+                    {"email": u["email"], "role": u["role"], "is_active": bool(u["is_active"])}
+                    for u in users if u["role"] in ("masteradmin", "superadmin")],
+                "master_email_variants": [
+                    u["email"] for u in users
+                    if (u["email"] or "").strip().lower() == MASTER_EMAIL and u["email"] != MASTER_EMAIL],
+                "unknown_roles": sorted({u["role"] for u in users
+                                         if u["role"] not in ("masteradmin", "superadmin", "dueno", "vendedor")},
+                                        key=str),
             }
 
         counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]

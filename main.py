@@ -598,7 +598,7 @@ def ensure_auth_schema():
                             {"v": AUTH_SCHEMA_VERSION}).fetchone():
             conn.execute(text("INSERT INTO schema_migrations (version, name, applied_at) VALUES (:v, :n, :t)"),
                          {"v": AUTH_SCHEMA_VERSION, "n": "Tablas de autenticación (Fase 2.1)",
-                          "t": datetime.datetime.utcnow()})
+                          "t": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)})
 
 ensure_auth_schema()
 
@@ -727,7 +727,7 @@ def init_db():
         db.add(admin)
         db.flush()
         if not DB_CONFIG.is_production:
-            now = datetime.datetime.utcnow()
+            now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
             db.add(UserCredentialDB(
                 user_id=admin.id,
                 password_hash=auth_core.hash_password(auth_core.DEFAULT_MASTER_PASSWORD),
@@ -956,9 +956,14 @@ LAST_SEEN_UPDATE_SECONDS = 60
 IP_LIMIT_MODES = ("observe", "enforce")
 
 
+def _utc_naive_now() -> datetime.datetime:
+    """UTC sin zona horaria, el mismo formato que el resto de las fechas guardadas."""
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 def _auth_utcnow() -> datetime.datetime:
-    """Hora actual UTC naive, como el resto de las fechas guardadas (los tests la reemplazan)."""
-    return datetime.datetime.utcnow()
+    """Hora actual para autenticación (los tests la reemplazan)."""
+    return _utc_naive_now()
 
 
 def auth_settings() -> dict:

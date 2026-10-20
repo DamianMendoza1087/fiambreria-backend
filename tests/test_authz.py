@@ -156,6 +156,14 @@ def test_role_hierarchy_and_capabilities_on_cash():
     assert code(anon.get("/cash/status", headers=who("caje", "cajero"))) == "FORBIDDEN_CAPABILITY"
     assert anon.get("/cash/status", headers=who("caje2", "cajero", can_caja=True)).status_code == 200
     assert anon.get("/cash/status", headers=who("super", "superadmin")).status_code == 200
+    # Dueño y superiores operan Caja sin can_caja; Encargado la necesita.
+    for name, role in (("dueno", "dueno"), ("super2", "superadmin"), ("master", "masteradmin")):
+        h = who(name, role)
+        for path in ("/cash/status", "/cash/movements", "/presales/pending", "/sales/history"):
+            assert anon.get(path, headers=h).status_code == 200, (role, path)
+    assert code(anon.get("/cash/status", headers=who("enc", "encargado"))) == "FORBIDDEN_CAPABILITY"
+    assert anon.get("/cash/status", headers=who("enc2", "encargado", can_caja=True)).status_code == 200
+    assert code(anon.get("/cash/movements", headers=who("vende2", "vendedor", can_caja=True))) == "FORBIDDEN_ROLE"
 
 
 def test_owner_only_and_master_only_routes():
@@ -379,7 +387,7 @@ def test_privileged_outflows_need_owner_or_authorized_manager(category):
     assert code(movement(enc, category)) == "FORBIDDEN_CAPABILITY"
     enc_ok = who("enc2", "encargado", can_caja=True, can_cash_privileged_outflows=True)
     assert movement(enc_ok, category).status_code == 200
-    dueno = who("dueno", "dueno", can_caja=True)
+    dueno = who("dueno", "dueno")                                       # sin can_caja
     assert movement(dueno, category).status_code == 200
 
 

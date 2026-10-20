@@ -1361,7 +1361,9 @@ def employee(cap=None, alt=None, branch=None, default=1, caps=None) -> Policy:
                    branch_default=default if branch == "query" else None)
 
 
-def cashier(cap="can_caja", alt=None, branch="query", default=1, caps=None) -> Policy:
+def cashier(cap="can_caja", alt="dueno", branch="query", default=1, caps=None) -> Policy:
+    """Caja: MASTERADMIN, SUPERADMIN y Dueño sin can_caja; Encargado y Cajero con can_caja.
+    Empleado de mostrador (vendedor) nunca, aunque tenga can_caja guardado."""
     caps = tuple(caps or ((cap,) if cap else ()))
     return _policy("CASHIER+" + "|".join(caps), min_role="cajero", caps=caps, cap_alt_role=alt,
                    branch=branch, branch_default=default if branch == "query" else None)
@@ -3567,7 +3569,7 @@ def get_sales_history(
     search: Optional[str] = None,
     limit: int = 100,
     db: Session = Depends(get_db)
-, ctx: AuthContext = Depends(cashier(alt="dueno"))):
+, ctx: AuthContext = Depends(cashier())):
     safe_limit = min(max(limit, 1), 500)
     query = db.query(SaleDB).filter(SaleDB.branch_id == branch_id)
 
@@ -3630,7 +3632,7 @@ def get_sale_detail(
     sale_id: int,
     branch_id: int = 1,
     db: Session = Depends(get_db)
-, ctx: AuthContext = Depends(cashier(alt="dueno"))):
+, ctx: AuthContext = Depends(cashier())):
     sale = db.query(SaleDB).filter(
         SaleDB.id == sale_id,
         SaleDB.branch_id == branch_id

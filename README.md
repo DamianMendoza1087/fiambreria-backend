@@ -216,6 +216,8 @@ anónimo ni interruptor de emergencia: una APK sin token recibe 401 en todo lo d
   mercadería y retiros del dueño (`POST /cash/movements` OUT, categoría normalizada sin tildes ni espacios)
   requieren Dueño o superior, o Encargado con la capacidad. Cajero y Empleado nunca, aunque esté guardada.
   Las mermas (`POST /stock/losses`) requieren `can_stock`.
+- **Caja**: MASTERADMIN, SUPERADMIN y Dueño operan Caja sin `can_caja`; Encargado y Cajero necesitan
+  `can_caja`; Empleado de mostrador (vendedor) nunca, aunque tenga `can_caja`.
 - **Turnos (U16)**: cada uno abre y cierra su propio turno; el de otro requiere Encargado o superior con
   `can_rrhh` y que el empleado comparta sucursal. El rol trabajado no supera el rol real.
 - **Feria**: plan, jornada en vivo, apertura y cierre requieren Dueño o superior con acceso a la sucursal.

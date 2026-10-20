@@ -146,3 +146,44 @@ Todavía no hay autenticación real. Mientras tanto:
   funcionando como hasta ahora.
 - `diagnose_db.py` informa cuentas administrativas, variantes del email maestro y roles desconocidos (sin
   contraseñas) para revisar si la escalada anónima previa fue utilizada.
+
+## Fase 2.1 — Autenticación (credenciales, sesiones, bloqueo, recuperación)
+
+En 2.1 los endpoints de negocio siguen sin exigir sesión (eso es 2.2). Lo nuevo:
+
+- **Contraseñas**: PBKDF2-SHA256, 600.000 iteraciones, sal de 16 bytes (`auth_core.py`, biblioteca
+  estándar). Se guardan en la tabla `user_credentials`, separada de `users`: ninguna respuesta de
+  usuarios puede incluirlas. Las contraseñas nuevas nunca se guardan en texto plano (`users.hashed_password`
+  recibe un valor aleatorio inutilizable).
+- **Política**: 10 a 128 caracteres; se rechazan admin123 y variantes, el email, contraseñas comunes y
+  repetir la actual. Sin reglas de mayúscula/número/símbolo.
+- **Login** (`POST /login`, mismo formulario y mismos campos de antes) devuelve además un token real,
+  `expires_at`, `must_change_password`, `password_change_reason` y `allowed_branch_ids`.
+- **Sesiones** (`auth_sessions`): token opaco; en la base solo su SHA-256. Vencen a las 12 h (empleados)
+  o 7 días (MASTERADMIN/SUPERADMIN); el límite se recalcula con el rol actual. Rol, permisos y estado se leen
+  de la base en cada pedido. Deshabilitar un usuario y cambiar la contraseña revocan sesiones.
+- **Endpoints**: `GET /auth/me`, `POST /auth/logout`, `POST /auth/change-password`. Con cambio de contraseña
+  pendiente, la dependencia `require_session` (que usarán los endpoints en 2.2) responde 403
+  `PASSWORD_CHANGE_REQUIRED`.
+- **Usuarios sin credencial** (bases previas a 2.1): el login compara contra la contraseña heredada sin
+  escribir nada y exige cambio. Arrancar el servicio **no crea ni modifica credenciales**.
+- **Bloqueo** (`auth_login_failures`, persistente): 5 fallos por email en 15 min bloquean 15 min (siempre).
+  20 fallos por IP en 15 min bloquean solo con `AUTH_IP_LIMIT_MODE=enforce`.
+  - `TRUSTED_PROXY_HOPS` (0 por defecto): cantidad de proxies confiables que agregan a `X-Forwarded-For`.
+    Con 0 se ignora esa cabecera. Con N se toma la entrada N-ésima desde el final; lo que está a su izquierda
+    lo pudo inventar el cliente.
+  - `AUTH_IP_LIMIT_MODE`: `observe` por defecto en producción (registra la IP vista y la cadena
+    `X-Forwarded-For` de cada sesión, sin bloquear), `enforce` fuera de producción.
+  - Verificación en producción: después del primer login, `python diagnose_db.py` → `auth_network.recent_sessions`
+    muestra `ip`, `peer_ip` y `forwarded_chain`. Comparar con la IP pública del teléfono, fijar
+    `TRUSTED_PROXY_HOPS` y recién entonces `AUTH_IP_LIMIT_MODE=enforce`.
+- **Producción**: sin `/docs`, `/redoc` ni `/openapi.json`. La semilla de una base nueva crea la cuenta maestra
+  sin contraseña utilizable (no se recrea admin123).
+- **Render Shell** (`manage_users.py`, hacer backup antes):
+  - `python manage_users.py reset-password --email admin@fiambreria.com` — clave temporal mostrada una sola vez,
+    cambio obligatorio, sesiones cerradas, bloqueo limpiado. `--activate` reactiva un MASTERADMIN deshabilitado.
+  - `python manage_users.py unlock --email …` — quita el bloqueo por intentos.
+  - `python manage_users.py migrate-credentials [--dry-run]` — convierte en hash las contraseñas heredadas
+    (idempotente; no borra el texto heredado).
+  - `python manage_users.py list-admins` — sin secretos.
+- La columna heredada `users.hashed_password` no se borra todavía (U8=A).

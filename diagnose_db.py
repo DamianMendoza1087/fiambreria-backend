@@ -14,6 +14,7 @@ import os
 import sqlite3
 import sys
 
+import auth_core
 import db_config
 
 MASTER_EMAIL = "admin@fiambreria.com"
@@ -142,16 +143,34 @@ def run_diagnostics(db_path, limit=EXAMPLES_LIMIT):
 
         security = {}
         if need("users"):
-            cols = _columns(conn, "users")
-            users = _rows(conn, "SELECT email, hashed_password, role, is_active FROM users")
+            users = _rows(conn, "SELECT id, email, hashed_password, role, is_active FROM users")
+            has_credentials = "user_credentials" in tables
+            creds = ({r["user_id"]: r for r in _rows(conn, "SELECT user_id, password_hash, must_change_password "
+                                                           "FROM user_credentials")}
+                     if has_credentials else {})
+
+            def master_uses_default(u):
+                # Con credencial manda el hash (la columna heredada ya no se usa para entrar).
+                if u["id"] in creds:
+                    return auth_core.verify_password(DEFAULT_MASTER_PASSWORD, creds[u["id"]]["password_hash"])
+                return u["hashed_password"] == DEFAULT_MASTER_PASSWORD
+
             security = {
                 "users_total": len(users),
                 "users_active": sum(1 for u in users if u["is_active"]),
-                # Hoy /login compara texto plano: todas las claves están guardadas así.
-                "plaintext_password_storage": "password_hash" not in cols,
+                # Contraseñas heredadas todavía guardadas en texto plano en users.hashed_password
+                # (U8=A: se borran después de validar la APK autenticada).
+                "plaintext_password_storage": any(not auth_core.is_unusable_legacy(u["hashed_password"])
+                                                  for u in users),
                 "default_master_password_in_use": any(
-                    (u["email"] or "").lower() == MASTER_EMAIL and u["hashed_password"] == DEFAULT_MASTER_PASSWORD
-                    for u in users),
+                    (u["email"] or "").lower() == MASTER_EMAIL and master_uses_default(u) for u in users),
+                "credentials": {
+                    "table_present": has_credentials,
+                    "users_with_credential": sum(1 for u in users if u["id"] in creds),
+                    "users_without_credential": sum(1 for u in users if u["id"] not in creds),
+                    "must_change_password_pending": sum(
+                        1 for u in users if u["id"] not in creds or creds[u["id"]]["must_change_password"]),
+                },
                 "roles": {r: sum(1 for u in users if u["role"] == r) for r in sorted({u["role"] for u in users})},
                 # Para revisar si alguien usó la escalada anónima previa al parche U1: cuentas
                 # administrativas (sin contraseñas) y variantes del email maestro con otras mayúsculas.
@@ -162,9 +181,33 @@ def run_diagnostics(db_path, limit=EXAMPLES_LIMIT):
                     u["email"] for u in users
                     if (u["email"] or "").strip().lower() == MASTER_EMAIL and u["email"] != MASTER_EMAIL],
                 "unknown_roles": sorted({u["role"] for u in users
-                                         if u["role"] not in ("masteradmin", "superadmin", "dueno", "vendedor")},
+                                         if u["role"] not in auth_core.ROLE_LEVELS},
                                         key=str),
             }
+
+        # Verificación de la IP que observa el backend detrás de Render (U18=B). Solo IPs, fechas y
+        # emails: nunca tokens, hashes, contraseñas ni cabeceras de autorización.
+        auth_network = {
+            "settings_seen_by_this_shell": {
+                "TRUSTED_PROXY_HOPS": os.environ.get("TRUSTED_PROXY_HOPS", "0 (por defecto)"),
+                "AUTH_IP_LIMIT_MODE": os.environ.get("AUTH_IP_LIMIT_MODE", "por defecto: observe en producción"),
+            },
+        }
+        if "auth_sessions" in tables:
+            auth_network["recent_sessions"] = _rows(conn, """
+                SELECT s.created_at, u.email, s.ip, s.peer_ip, s.forwarded_chain, s.ip_source,
+                       s.client_version, s.revoked_at IS NOT NULL AS revoked
+                FROM auth_sessions s LEFT JOIN users u ON u.id = s.user_id
+                ORDER BY s.id DESC LIMIT 10""")
+        if "auth_login_failures" in tables:
+            auth_network["login_failures_last_24h_by_ip"] = _rows(conn, """
+                SELECT ip, peer_ip, COUNT(*) AS failures, MAX(created_at) AS last_failure
+                FROM auth_login_failures WHERE created_at > datetime('now', '-1 day')
+                GROUP BY ip, peer_ip ORDER BY failures DESC LIMIT 10""")
+            auth_network["login_failures_last_24h_by_email"] = _rows(conn, """
+                SELECT email_key, COUNT(*) AS failures, MAX(created_at) AS last_failure
+                FROM auth_login_failures WHERE created_at > datetime('now', '-1 day')
+                GROUP BY email_key ORDER BY failures DESC LIMIT 10""")
 
         counts = {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
                   for t in sorted(tables) if not t.startswith("sqlite_")}
@@ -177,6 +220,7 @@ def run_diagnostics(db_path, limit=EXAMPLES_LIMIT):
         "integrity_quick_check": integrity[:5],
         "table_counts": counts,
         "security": security,
+        "auth_network": auth_network,
         "checks": checks,
         "skipped": skipped,
         "summary": {c["check"]: c["count"] for c in checks},

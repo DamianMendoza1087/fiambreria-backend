@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text, or_, Numeric
@@ -14,6 +14,8 @@ import json
 from decimal import Decimal
 import fair_planning
 from fair_planning import D, to_cents
+import os
+import auth_core
 
 # Valida configuración/ruta y, en producción, que la base exista y sea válida
 # (o que su creación esté autorizada) ANTES de cualquier create_all/init_db.
@@ -186,6 +188,55 @@ class AuditEventDB(Base):
     actor = Column(String, nullable=True)
     reason = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    # Fase 2.1 (ensure_auth_schema las agrega en bases existentes). NULL en registros históricos:
+    # el actor de esos registros fue declarado por la app y no está verificado.
+    actor_user_id = Column(Integer, nullable=True)
+    actor_source = Column(String, nullable=True)      # session | cli | system | legacy_client
+    session_id = Column(Integer, nullable=True)
+
+# ===== AUTENTICACIÓN (Fase 2.1) =====
+# Las credenciales viven fuera de `users`: ninguna serialización de usuario puede incluirlas.
+
+class UserCredentialDB(Base):
+    __tablename__ = "user_credentials"
+    user_id = Column(Integer, ForeignKey("users.id"), primary_key=True)
+    password_hash = Column(String, nullable=False)          # pbkdf2_sha256$iter$sal$hash
+    must_change_password = Column(Boolean, nullable=False, default=True)
+    change_reason = Column(String, nullable=True)           # DEFAULT_PASSWORD | LEGACY_PLAINTEXT | TEMPORARY | INITIAL
+    password_changed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+class AuthSessionDB(Base):
+    __tablename__ = "auth_sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)   # SHA-256; nunca el token
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False)
+    expires_at = Column(DateTime, nullable=False, index=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_reason = Column(String, nullable=True)
+    ip = Column(String, nullable=True)
+    peer_ip = Column(String, nullable=True)
+    forwarded_chain = Column(String, nullable=True)   # solo mientras el límite por IP esté en "observe"
+    ip_source = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+    client_version = Column(String, nullable=True)
+
+class AuthLoginFailureDB(Base):
+    __tablename__ = "auth_login_failures"
+    id = Column(Integer, primary_key=True, index=True)
+    email_key = Column(String, nullable=False, index=True)   # email en minúsculas (exista o no)
+    ip = Column(String, nullable=True, index=True)
+    peer_ip = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, index=True)
+
+class SchemaMigrationDB(Base):
+    __tablename__ = "schema_migrations"
+    version = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    applied_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 class PriceHistoryDB(Base):
     __tablename__ = "price_history"
@@ -523,9 +574,40 @@ def ensure_fair_live_schema():
 
 ensure_fair_live_schema()
 
-app = FastAPI(title="Fiambrería POS, RRHH, MRP, KPIs & Permisos API")
+AUTH_SCHEMA_VERSION = "2.1-auth"
+
+def ensure_auth_schema():
+    """Fase 2.1: tablas de autenticación y columnas de actor verificado.
+
+    Idempotente y aditiva: crea lo que falta y no borra ni recrea nada. NO crea ni modifica
+    credenciales de usuarios existentes: eso solo ocurre con `manage_users.py migrate-credentials`
+    o cuando el propio usuario cambia su contraseña.
+    """
+    Base.metadata.create_all(bind=engine)
+    audit_cols = {c["name"] for c in inspect(engine).get_columns("audit_events")}
+    with engine.begin() as conn:
+        for column_name, ddl in {"actor_user_id": "INTEGER", "actor_source": "VARCHAR",
+                                 "session_id": "INTEGER"}.items():
+            if column_name not in audit_cols:
+                conn.execute(text(f"ALTER TABLE audit_events ADD COLUMN {column_name} {ddl}"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_auth_login_failures_email_created "
+                          "ON auth_login_failures (email_key, created_at)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_auth_login_failures_ip_created "
+                          "ON auth_login_failures (ip, created_at)"))
+        if not conn.execute(text("SELECT 1 FROM schema_migrations WHERE version = :v"),
+                            {"v": AUTH_SCHEMA_VERSION}).fetchone():
+            conn.execute(text("INSERT INTO schema_migrations (version, name, applied_at) VALUES (:v, :n, :t)"),
+                         {"v": AUTH_SCHEMA_VERSION, "n": "Tablas de autenticación (Fase 2.1)",
+                          "t": datetime.datetime.utcnow()})
+
+ensure_auth_schema()
+
+# U19=A: sin documentación interactiva ni esquema OpenAPI en producción.
+_DOCS_KWARGS = ({"docs_url": None, "redoc_url": None, "openapi_url": None}
+                if DB_CONFIG.is_production else {})
+app = FastAPI(title="Fiambrería POS, RRHH, MRP, KPIs & Permisos API", **_DOCS_KWARGS)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
-                   expose_headers=["X-Error-Code"])
+                   expose_headers=["X-Error-Code", "Retry-After"])
 
 # Código de error legible por la app en el header X-Error-Code; el "detail" sigue siendo un texto
 # para que las versiones anteriores de la app muestren un mensaje claro.
@@ -611,22 +693,49 @@ def format_iso_to_ddmmyyyy(iso_input) -> str:
         return f"{parts[2]}/{parts[1]}/{parts[0]}"
     return iso_str
 
+MASTER_ADMIN_EMAIL = "admin@fiambreria.com"
+
 def init_db():
+    """Semilla de la cuenta maestra, solo si no existe (nunca modifica una cuenta existente).
+
+    - Producción: se crea SIN contraseña utilizable. Se inicializa con
+      `python manage_users.py reset-password --email admin@fiambreria.com` en el Shell de Render.
+    - Desarrollo/tests: contraseña admin123 guardada como hash y marcada para cambio obligatorio.
+    En ningún caso se guarda una contraseña nueva en texto plano.
+    """
     db = SessionLocal()
-    admin = db.query(UserDB).filter(UserDB.email == "admin@fiambreria.com").first()
-    if not admin:
-        db.add(UserDB(
+    try:
+        admin = db.query(UserDB).filter(func.lower(UserDB.email) == MASTER_ADMIN_EMAIL).first()
+        if admin:
+            # Compatibilidad con bases antiguas: el login promovía esta cuenta por email. Solo si no
+            # queda ningún MASTERADMIN activo se conserva esa promoción (invariante: al menos uno).
+            has_master = db.query(UserDB).filter(UserDB.role == "masteradmin", UserDB.is_active == True).first()
+            if not has_master and admin.role == "superadmin":
+                admin.role = "masteradmin"
+                db.commit()
+            return
+        admin = UserDB(
             name="Super Admin",
-            email="admin@fiambreria.com",
-            hashed_password="admin123",
-            role="superadmin",
+            email=MASTER_ADMIN_EMAIL,
+            hashed_password=auth_core.unusable_legacy_value(),
+            role="masteradmin",
             is_active=True,
             can_preventa=True, can_caja=True, can_stock=True, can_ingreso=True,
             can_alertas=True, can_rrhh=True, can_mrp=True, can_verificacion=True,
             can_kpis=True, can_carteleria=True, can_edit_records=True
-        ))
+        )
+        db.add(admin)
+        db.flush()
+        if not DB_CONFIG.is_production:
+            now = datetime.datetime.utcnow()
+            db.add(UserCredentialDB(
+                user_id=admin.id,
+                password_hash=auth_core.hash_password(auth_core.DEFAULT_MASTER_PASSWORD),
+                must_change_password=True, change_reason=auth_core.REASON_DEFAULT_PASSWORD,
+                created_at=now, updated_at=now))
         db.commit()
-    db.close()
+    finally:
+        db.close()
 
 init_db()
 verify_database_after_init(DB_CONFIG)
@@ -821,33 +930,309 @@ class IngressCorrectionSchema(BaseModel):
     actor: str
     reason: str
 
+# =====================================================================
+# AUTENTICACIÓN (Fase 2.1)
+# Contraseñas con hash (auth_core), sesiones opacas revocables en la base, bloqueo por intentos
+# fallidos persistente. En 2.1 los endpoints de negocio siguen sin exigir sesión: eso es 2.2.
+# =====================================================================
+
+ERROR_AUTH_REQUIRED = "AUTH_REQUIRED"
+ERROR_SESSION_INVALID = "SESSION_INVALID"
+ERROR_SESSION_EXPIRED = "SESSION_EXPIRED"
+ERROR_SESSION_REVOKED = "SESSION_REVOKED"
+ERROR_USER_DISABLED = "USER_DISABLED"
+ERROR_PASSWORD_CHANGE_REQUIRED = "PASSWORD_CHANGE_REQUIRED"
+ERROR_ACCOUNT_LOCKED = "ACCOUNT_LOCKED"
+ERROR_TOO_MANY_ATTEMPTS_IP = "TOO_MANY_ATTEMPTS_IP"
+ERROR_PASSWORD_POLICY = "PASSWORD_POLICY"
+ERROR_INVALID_CREDENTIALS = "INVALID_CREDENTIALS"
+
+ACCOUNT_LOCK_THRESHOLD = 5          # fallos por cuenta (email) ...
+ACCOUNT_LOCK_MINUTES = 15           # ... dentro de esta ventana bloquean la cuenta 15 minutos
+IP_LOCK_THRESHOLD = 20              # fallos por IP ...
+IP_LOCK_WINDOW_MINUTES = 15         # ... en esta ventana
+LOGIN_FAILURE_RETENTION_HOURS = 24
+LAST_SEEN_UPDATE_SECONDS = 60
+IP_LIMIT_MODES = ("observe", "enforce")
+
+
+def _auth_utcnow() -> datetime.datetime:
+    """Hora actual UTC naive, como el resto de las fechas guardadas (los tests la reemplazan)."""
+    return datetime.datetime.utcnow()
+
+
+def auth_settings() -> dict:
+    """Configuración de red del login, leída del entorno en cada uso.
+
+    - TRUSTED_PROXY_HOPS: proxies confiables delante del backend (0 a 5). Por defecto 0:
+      X-Forwarded-For se ignora y se usa la dirección de la conexión.
+    - AUTH_IP_LIMIT_MODE: observe | enforce. Por defecto `observe` en producción (registra pero
+      no bloquea por IP hasta verificar qué IP real llega detrás de Render) y `enforce` fuera de
+      producción. El límite por cuenta siempre está activo.
+    """
+    try:
+        hops = int(os.environ.get("TRUSTED_PROXY_HOPS", "0").strip() or 0)
+    except ValueError:
+        hops = 0
+    if not 0 <= hops <= auth_core.MAX_TRUSTED_PROXY_HOPS:
+        hops = 0
+    mode = (os.environ.get("AUTH_IP_LIMIT_MODE") or "").strip().lower()
+    if mode not in IP_LIMIT_MODES:
+        mode = "observe" if DB_CONFIG.is_production else "enforce"
+    return {"trusted_proxy_hops": hops, "ip_limit_mode": mode}
+
+
+def _client_address(request: Request) -> auth_core.ClientAddress:
+    peer = request.client.host if request.client else None
+    return auth_core.resolve_client_address(peer, request.headers.get("x-forwarded-for"),
+                                            auth_settings()["trusted_proxy_hops"])
+
+
+def _auth_error(status_code: int, code: str, detail: str, extra_headers: Optional[dict] = None) -> HTTPException:
+    headers = {"X-Error-Code": code}
+    if status_code == 401:
+        headers["WWW-Authenticate"] = "Bearer"
+    headers.update(extra_headers or {})
+    return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+
+def _email_key(email: Optional[str]) -> str:
+    return (email or "").strip().lower()[:254]
+
+
+def _find_user_by_email(db: Session, email: str) -> Optional[UserDB]:
+    clean = (email or "").strip()
+    if not clean:
+        return None
+    exact = db.query(UserDB).filter(UserDB.email == clean).first()
+    if exact:
+        return exact
+    return db.query(UserDB).filter(func.lower(UserDB.email) == clean.lower()).order_by(UserDB.id.asc()).first()
+
+
+# --- Bloqueo por intentos fallidos (persistente en la base: sobrevive a reinicios) -------------
+
+def _recent_failures(db: Session, now: datetime.datetime, minutes: int, **filters):
+    q = db.query(AuthLoginFailureDB).filter(
+        AuthLoginFailureDB.created_at > now - datetime.timedelta(minutes=minutes))
+    for column, value in filters.items():
+        q = q.filter(getattr(AuthLoginFailureDB, column) == value)
+    return q
+
+
+def _check_login_limits(db: Session, email_key: str, address: auth_core.ClientAddress,
+                        now: datetime.datetime):
+    """Lanza 429 si la IP (en modo enforce) o la cuenta están bloqueadas. No verifica la contraseña."""
+    if auth_settings()["ip_limit_mode"] == "enforce" and address.ip:
+        ip_failures = _recent_failures(db, now, IP_LOCK_WINDOW_MINUTES, ip=address.ip).count()
+        if ip_failures >= IP_LOCK_THRESHOLD:
+            raise _auth_error(429, ERROR_TOO_MANY_ATTEMPTS_IP,
+                              "Demasiados intentos fallidos desde esta conexión. Probá de nuevo en unos minutos.",
+                              {"Retry-After": str(IP_LOCK_WINDOW_MINUTES * 60)})
+    recent = _recent_failures(db, now, ACCOUNT_LOCK_MINUTES, email_key=email_key) \
+        .order_by(AuthLoginFailureDB.created_at.desc()).limit(ACCOUNT_LOCK_THRESHOLD).all()
+    if len(recent) >= ACCOUNT_LOCK_THRESHOLD:
+        unlock_at = recent[-1].created_at + datetime.timedelta(minutes=ACCOUNT_LOCK_MINUTES)
+        seconds = max(1, int((unlock_at - now).total_seconds()))
+        raise _auth_error(429, ERROR_ACCOUNT_LOCKED,
+                          f"Cuenta bloqueada por intentos fallidos. Probá de nuevo en {max(1, (seconds + 59) // 60)} minutos.",
+                          {"Retry-After": str(seconds)})
+
+
+def _record_login_failure(db: Session, email_key: str, address: auth_core.ClientAddress,
+                          now: datetime.datetime):
+    db.add(AuthLoginFailureDB(email_key=email_key, ip=address.ip, peer_ip=address.peer, created_at=now))
+    db.query(AuthLoginFailureDB).filter(
+        AuthLoginFailureDB.created_at < now - datetime.timedelta(hours=LOGIN_FAILURE_RETENTION_HOURS)
+    ).delete(synchronize_session=False)
+    db.commit()
+
+
+def _clear_login_failures(db: Session, email_key: str):
+    db.query(AuthLoginFailureDB).filter(AuthLoginFailureDB.email_key == email_key) \
+        .delete(synchronize_session=False)
+
+
+# --- Verificación de contraseña ----------------------------------------------------------------
+
+def _credential(db: Session, user_id: int) -> Optional[UserCredentialDB]:
+    return db.query(UserCredentialDB).filter(UserCredentialDB.user_id == user_id).first()
+
+
+def _verify_user_password(db: Session, user: Optional[UserDB], password: str):
+    """(ok, credencial). Siempre cuesta un PBKDF2, exista o no el usuario.
+
+    Usuarios con credencial: solo se usa el hash. Usuarios sin credencial (base previa a 2.1):
+    se compara contra la contraseña heredada SIN escribir nada; la sesión exige cambio (U7=A).
+    """
+    if user is None:
+        auth_core.dummy_verify(password)
+        return False, None
+    cred = _credential(db, user.id)
+    if cred is not None:
+        return auth_core.verify_password(password, cred.password_hash), cred
+    auth_core.dummy_verify(password)
+    return auth_core.verify_legacy_plaintext(password, user.hashed_password), None
+
+
+def _password_change_state(user: UserDB, cred: Optional[UserCredentialDB]):
+    if cred is None:
+        return True, auth_core.legacy_change_reason(user.hashed_password)
+    return bool(cred.must_change_password), (cred.change_reason if cred.must_change_password else None)
+
+
+def set_user_password(db: Session, user: UserDB, new_password: str, must_change: bool,
+                      reason: Optional[str], now: datetime.datetime) -> UserCredentialDB:
+    """Guarda SOLO el hash. No toca users.hashed_password (U8=A: el texto heredado se borra después)."""
+    cred = _credential(db, user.id)
+    hashed = auth_core.hash_password(new_password)
+    if cred is None:
+        cred = UserCredentialDB(user_id=user.id, password_hash=hashed, created_at=now)
+        db.add(cred)
+    cred.password_hash = hashed
+    cred.must_change_password = must_change
+    cred.change_reason = reason if must_change else None
+    cred.password_changed_at = None if must_change else now
+    cred.updated_at = now
+    return cred
+
+
+# --- Sesiones ----------------------------------------------------------------------------------
+
+def _session_effective_expiry(session: AuthSessionDB, user: UserDB) -> datetime.datetime:
+    """El vencimiento se recalcula con el rol ACTUAL: degradar un admin acorta sus sesiones."""
+    cap = session.created_at + datetime.timedelta(hours=auth_core.session_max_hours(user.role))
+    return min(session.expires_at, cap)
+
+
+def _create_session(db: Session, user: UserDB, request: Request, address: auth_core.ClientAddress,
+                    now: datetime.datetime):
+    token = auth_core.new_session_token()
+    observing = auth_settings()["ip_limit_mode"] == "observe"
+    session = AuthSessionDB(
+        token_hash=auth_core.token_digest(token), user_id=user.id, created_at=now,
+        expires_at=now + datetime.timedelta(hours=auth_core.session_max_hours(user.role)),
+        last_seen_at=now, ip=address.ip, peer_ip=address.peer, ip_source=address.source,
+        forwarded_chain=auth_core.chain_json(address.forwarded_chain) if observing else None,
+        user_agent=(request.headers.get("user-agent") or "")[:200] or None,
+        client_version=(request.headers.get("x-client-version") or "")[:20] or None,
+    )
+    db.add(session)
+    db.flush()
+    return token, session
+
+
+def revoke_user_sessions(db: Session, user_id: int, reason: str, now: datetime.datetime,
+                         except_session_id: Optional[int] = None) -> int:
+    q = db.query(AuthSessionDB).filter(AuthSessionDB.user_id == user_id, AuthSessionDB.revoked_at == None)
+    if except_session_id is not None:
+        q = q.filter(AuthSessionDB.id != except_session_id)
+    return q.update({"revoked_at": now, "revoked_reason": reason}, synchronize_session=False)
+
+
+class AuthContext:
+    """Identidad autenticada de un pedido. En 2.2 el actor de auditoría sale de acá."""
+
+    def __init__(self, user: UserDB, session: AuthSessionDB, must_change_password: bool,
+                 change_reason: Optional[str]):
+        self.user = user
+        self.session = session
+        self.must_change_password = must_change_password
+        self.change_reason = change_reason
+
+    @property
+    def actor_email(self) -> str:
+        return self.user.email
+
+    def audit_fields(self) -> dict:
+        return {"actor": self.user.email, "actor_user_id": self.user.id,
+                "actor_source": "session", "session_id": self.session.id}
+
+
+def _bearer_token(request: Request) -> Optional[str]:
+    header = request.headers.get("authorization") or ""
+    scheme, _, value = header.partition(" ")
+    if scheme.lower() != "bearer" or not value.strip():
+        return None
+    return value.strip()
+
+
+def _resolve_auth_context(request: Request, db: Session, allow_pending_password_change: bool) -> AuthContext:
+    token = _bearer_token(request)
+    if not token:
+        raise _auth_error(401, ERROR_AUTH_REQUIRED, "Iniciá sesión para continuar.")
+    session = db.query(AuthSessionDB).filter(AuthSessionDB.token_hash == auth_core.token_digest(token)).first()
+    if session is None:
+        raise _auth_error(401, ERROR_SESSION_INVALID, "La sesión no es válida. Iniciá sesión de nuevo.")
+    if session.revoked_at is not None:
+        raise _auth_error(401, ERROR_SESSION_REVOKED, "La sesión fue cerrada. Iniciá sesión de nuevo.")
+    user = db.query(UserDB).filter(UserDB.id == session.user_id).first()
+    if user is None or not user.is_active:
+        raise _auth_error(401, ERROR_USER_DISABLED, "Tu usuario está deshabilitado.")
+    now = _auth_utcnow()
+    if now >= _session_effective_expiry(session, user):
+        raise _auth_error(401, ERROR_SESSION_EXPIRED, "La sesión venció. Iniciá sesión de nuevo.")
+    must_change, reason = _password_change_state(user, _credential(db, user.id))
+    if must_change and not allow_pending_password_change:
+        raise _auth_error(403, ERROR_PASSWORD_CHANGE_REQUIRED, "Tenés que cambiar tu contraseña antes de continuar.")
+    if session.last_seen_at is None or (now - session.last_seen_at).total_seconds() >= LAST_SEEN_UPDATE_SECONDS:
+        session.last_seen_at = now
+        db.commit()
+    return AuthContext(user, session, must_change, reason)
+
+
+def require_session(request: Request, db: Session = Depends(get_db)) -> AuthContext:
+    """Sesión válida, usuario activo y sin cambio de contraseña pendiente (para 2.2)."""
+    return _resolve_auth_context(request, db, allow_pending_password_change=False)
+
+
+def require_session_allow_password_change(request: Request, db: Session = Depends(get_db)) -> AuthContext:
+    """Como require_session, pero admite el cambio de contraseña pendiente (/auth/*)."""
+    return _resolve_auth_context(request, db, allow_pending_password_change=True)
+
+
+def _allowed_branch_ids(db: Session, user: UserDB) -> List[int]:
+    """U14=A: MASTERADMIN y SUPERADMIN todas las sucursales activas; el resto la asignada.
+    (La tabla de sucursales por usuario y su validación en cada endpoint son de 2.2.)"""
+    if (user.role or "") in auth_core.ADMIN_ROLES:
+        return [b.id for b in db.query(BranchDB).filter(BranchDB.is_active == True).order_by(BranchDB.id).all()]
+    return [user.branch_id or 1]
+
+
+# --- Endpoints ---------------------------------------------------------------------------------
+
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(UserDB).filter(UserDB.email == form_data.username).first()
-    if not user or user.hashed_password != form_data.password:
-        raise HTTPException(status_code=400, detail="Credenciales incorrectas")
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    now = _auth_utcnow()
+    address = _client_address(request)
+    email_key = _email_key(form_data.username)
+    _check_login_limits(db, email_key, address, now)
 
-    if user.email.lower() == "admin@fiambreria.com":
-        changed = False
-        if user.role != "masteradmin":
-            user.role = "masteradmin"
-            changed = True
-        if not user.is_active:
-            user.is_active = True
-            changed = True
-        if not user.can_edit_records:
-            user.can_edit_records = True
-            changed = True
-        if not user.can_carteleria:
-            user.can_carteleria = True
-            changed = True
-        if changed:
-            db.commit()
-            db.refresh(user)
+    user = _find_user_by_email(db, form_data.username)
+    ok, cred = _verify_user_password(db, user, form_data.password)
+    if not ok:
+        _record_login_failure(db, email_key, address, now)
+        raise _auth_error(400, ERROR_INVALID_CREDENTIALS, "Credenciales incorrectas")
+    if not user.is_active:
+        raise _auth_error(403, ERROR_USER_DISABLED,
+                          "Tu usuario no está habilitado. Pedile al administrador que lo habilite.")
 
+    _clear_login_failures(db, email_key)
+    if cred is not None and auth_core.needs_rehash(cred.password_hash):
+        cred.password_hash = auth_core.hash_password(form_data.password)
+        cred.updated_at = now
+    must_change, reason = _password_change_state(user, cred)
+    token, session = _create_session(db, user, request, address, now)
+    db.commit()
+
+    # Mismos campos que antes (la APK instalada los usa) + sesión real.
     return {
-        "access_token": f"token-{user.id}",
+        "access_token": token,
         "token_type": "bearer",
+        "expires_at": _session_effective_expiry(session, user).isoformat() + "Z",
+        "must_change_password": must_change,
+        "password_change_reason": reason,
+        "allowed_branch_ids": _allowed_branch_ids(db, user),
         "role": user.role,
         "is_active": user.is_active,
         "can_preventa": user.can_preventa,
@@ -864,13 +1249,67 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         "branch_id": user.branch_id or 1
     }
 
+
+@app.get("/auth/me")
+def auth_me(ctx: AuthContext = Depends(require_session_allow_password_change), db: Session = Depends(get_db)):
+    return {
+        "user": serialize_user(ctx.user),
+        "must_change_password": ctx.must_change_password,
+        "password_change_reason": ctx.change_reason,
+        "allowed_branch_ids": _allowed_branch_ids(db, ctx.user),
+        "session": {
+            "created_at": ctx.session.created_at.isoformat() + "Z",
+            "expires_at": _session_effective_expiry(ctx.session, ctx.user).isoformat() + "Z",
+        },
+    }
+
+
+@app.post("/auth/logout")
+def auth_logout(ctx: AuthContext = Depends(require_session_allow_password_change), db: Session = Depends(get_db)):
+    ctx.session.revoked_at = _auth_utcnow()
+    ctx.session.revoked_reason = "LOGOUT"
+    db.commit()
+    return {"status": "success"}
+
+
+class ChangePasswordSchema(BaseModel):
+    current_password: str
+    new_password: str
+
+
+@app.post("/auth/change-password")
+def auth_change_password(payload: ChangePasswordSchema, request: Request,
+                         ctx: AuthContext = Depends(require_session_allow_password_change),
+                         db: Session = Depends(get_db)):
+    now = _auth_utcnow()
+    user = ctx.user
+    email_key = _email_key(user.email)
+    address = _client_address(request)
+    _check_login_limits(db, email_key, address, now)
+    ok, _ = _verify_user_password(db, user, payload.current_password)
+    if not ok:
+        _record_login_failure(db, email_key, address, now)
+        raise _auth_error(400, ERROR_INVALID_CREDENTIALS, "La contraseña actual no es correcta.")
+    violation = auth_core.check_password_policy(payload.new_password, user.email, payload.current_password)
+    if violation:
+        raise _auth_error(422, ERROR_PASSWORD_POLICY, violation.message, {"X-Policy-Code": violation.code})
+
+    _clear_login_failures(db, email_key)
+    set_user_password(db, user, payload.new_password, must_change=False, reason=None, now=now)
+    revoked = revoke_user_sessions(db, user.id, "PASSWORD_CHANGED", now, except_session_id=ctx.session.id)
+    db.add(AuditEventDB(entity_type="user", entity_id=user.id, field_name="password",
+                        old_value=None, new_value=None, reason="Cambio de contraseña",
+                        created_at=now, **ctx.audit_fields()))
+    db.commit()
+    return {"status": "success", "must_change_password": False, "other_sessions_revoked": revoked}
+
+
 # ===== USUARIOS: parche de seguridad U1 (previo a la autenticación real de Fase 2.1) =====
 # Todavía no hay autenticación: estos endpoints son anónimos. Por eso:
 # - nunca devuelven contraseñas ni ningún otro secreto (lista blanca de campos);
 # - las operaciones que podrían crear o modificar administradores quedan BLOQUEADAS hasta 2.1,
 #   en lugar de "protegerlas" con datos que manda el propio cliente (rol, email, actor, headers).
 
-MASTER_ADMIN_EMAIL = "admin@fiambreria.com"
 ADMIN_LEVEL_ROLES = ("masteradmin", "superadmin")
 # Roles que un pedido anónimo puede asignar mientras no exista autenticación real.
 ANONYMOUS_ASSIGNABLE_ROLES = ("dueno", "vendedor")
@@ -922,10 +1361,16 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
     if lowered == MASTER_ADMIN_EMAIL or db.query(UserDB).filter(func.lower(UserDB.email) == lowered).first():
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
 
+    # Fase 2.1: la contraseña inicial cumple la política y se guarda SOLO como hash; la columna
+    # heredada recibe un valor inutilizable. El usuario debe cambiarla en su primer ingreso.
+    violation = auth_core.check_password_policy(password, email)
+    if violation:
+        raise _auth_error(422, ERROR_PASSWORD_POLICY, violation.message, {"X-Policy-Code": violation.code})
+
     new_u = UserDB(
         name=name,
         email=email,
-        hashed_password=password,
+        hashed_password=auth_core.unusable_legacy_value(),
         role=role,
         is_active=False,
         can_preventa=True, can_caja=False, can_stock=False, can_ingreso=False,
@@ -934,7 +1379,10 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
         can_edit_records=False,
         branch_id=int(user_data.get("branch_id", 1) or 1)
     )
-    db.add(new_u); db.commit(); db.refresh(new_u)
+    db.add(new_u); db.flush()
+    set_user_password(db, new_u, password, must_change=True, reason=auth_core.REASON_INITIAL,
+                      now=_auth_utcnow())
+    db.commit(); db.refresh(new_u)
     return serialize_user(new_u)
 
 @app.patch("/users/{user_id}/permissions")
@@ -955,7 +1403,10 @@ def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends
         raise HTTPException(status_code=400, detail="Sucursal invalida")
 
     if p.role is not None: u.role=p.role
-    if p.is_active is not None: u.is_active=p.is_active
+    if p.is_active is not None:
+        u.is_active=p.is_active
+        if not p.is_active:
+            revoke_user_sessions(db, u.id, "USER_DISABLED", _auth_utcnow())
     if p.can_preventa is not None: u.can_preventa=p.can_preventa
     if p.can_caja is not None: u.can_caja=p.can_caja
     if p.can_stock is not None: u.can_stock=p.can_stock
@@ -977,6 +1428,8 @@ def update_user_status(user_id: int, payload: UserStatusSchema, db: Session=Depe
     if _is_admin_level_user(u):
         raise _admin_operation_blocked("No se puede habilitar ni deshabilitar a un MASTERADMIN o SUPERADMIN.")
     u.is_active=payload.is_active
+    if not payload.is_active:
+        revoke_user_sessions(db, u.id, "USER_DISABLED", _auth_utcnow())
     db.commit()
     return {"status":"success","user_id":u.id,"is_active":u.is_active}
 

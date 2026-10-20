@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, ForeignKey, DateTime, func, Text, inspect, text, or_, Numeric
@@ -48,6 +48,9 @@ class UserDB(Base):
     can_carteleria = Column(Boolean, default=False)
     can_edit_records = Column(Boolean, default=False)  # Controla si el dueño/usuario puede editar/eliminar registros
     branch_id = Column(Integer, default=1, index=True)  # Sucursal de trabajo predeterminada
+    # U17/U15 (Fase 2.2): egresos PROVEEDOR / RETIRO_DUENO. Solo tiene efecto para ENCARGADO;
+    # Dueño o superior lo tienen por rol y Cajero/Vendedor nunca (ver auth_core.capability_allowed).
+    can_cash_privileged_outflows = Column(Boolean, default=False)
 
 class BranchDB(Base):
     __tablename__ = "branches"
@@ -231,6 +234,13 @@ class AuthLoginFailureDB(Base):
     ip = Column(String, nullable=True, index=True)
     peer_ip = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, index=True)
+
+class UserBranchDB(Base):
+    """Sucursales asignadas a cada usuario (Fase 2.2). MASTERADMIN/SUPERADMIN acceden a todas por rol."""
+    __tablename__ = "user_branches"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    branch_id = Column(Integer, ForeignKey("branches.id"), nullable=False, index=True)
 
 class SchemaMigrationDB(Base):
     __tablename__ = "schema_migrations"
@@ -602,6 +612,34 @@ def ensure_auth_schema():
 
 ensure_auth_schema()
 
+AUTHZ_SCHEMA_VERSION = "2.2-authz"
+
+def ensure_authz_schema():
+    """Fase 2.2: capacidad de egresos privilegiados y sucursales por usuario.
+
+    Aditiva e idempotente: agrega la columna si falta, crea user_branches y asigna a cada usuario
+    que todavía no tiene ninguna fila su sucursal actual (users.branch_id). No modifica credenciales,
+    roles, permisos existentes ni la columna heredada de contraseñas.
+    """
+    Base.metadata.create_all(bind=engine)
+    user_cols = {c["name"] for c in inspect(engine).get_columns("users")}
+    with engine.begin() as conn:
+        if "can_cash_privileged_outflows" not in user_cols:
+            conn.execute(text("ALTER TABLE users ADD COLUMN can_cash_privileged_outflows BOOLEAN DEFAULT 0"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_user_branches_user_branch "
+                          "ON user_branches (user_id, branch_id)"))
+        conn.execute(text(
+            "INSERT INTO user_branches (user_id, branch_id) "
+            "SELECT u.id, COALESCE(u.branch_id, 1) FROM users u "
+            "WHERE NOT EXISTS (SELECT 1 FROM user_branches ub WHERE ub.user_id = u.id)"))
+        if not conn.execute(text("SELECT 1 FROM schema_migrations WHERE version = :v"),
+                            {"v": AUTHZ_SCHEMA_VERSION}).fetchone():
+            conn.execute(text("INSERT INTO schema_migrations (version, name, applied_at) VALUES (:v, :n, :t)"),
+                         {"v": AUTHZ_SCHEMA_VERSION, "n": "Autorización y sucursales por usuario (Fase 2.2)",
+                          "t": datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)})
+
+ensure_authz_schema()
+
 # U19=A: sin documentación interactiva ni esquema OpenAPI en producción.
 _DOCS_KWARGS = ({"docs_url": None, "redoc_url": None, "openapi_url": None}
                 if DB_CONFIG.is_production else {})
@@ -740,9 +778,6 @@ def init_db():
 init_db()
 verify_database_after_init(DB_CONFIG)
 
-@app.get("/health")
-def health():
-    return database_health(DB_CONFIG, engine)
 
 class AuditSchema(BaseModel):
     counted_qty: float
@@ -762,7 +797,9 @@ class PermissionsSchema(BaseModel):
     can_kpis: Optional[bool] = None
     can_carteleria: Optional[bool] = None
     can_edit_records: Optional[bool] = None
+    can_cash_privileged_outflows: Optional[bool] = None
     branch_id: Optional[int] = None
+    branch_ids: Optional[List[int]] = None
 
 class ItemSchema(BaseModel):
     product_id: int
@@ -1196,18 +1233,213 @@ def require_session_allow_password_change(request: Request, db: Session = Depend
     return _resolve_auth_context(request, db, allow_pending_password_change=True)
 
 
-def _allowed_branch_ids(db: Session, user: UserDB) -> List[int]:
-    """U14=A: MASTERADMIN y SUPERADMIN todas las sucursales activas; el resto la asignada.
-    (La tabla de sucursales por usuario y su validación en cada endpoint son de 2.2.)"""
-    if (user.role or "") in auth_core.ADMIN_ROLES:
-        return [b.id for b in db.query(BranchDB).filter(BranchDB.is_active == True).order_by(BranchDB.id).all()]
-    return [user.branch_id or 1]
+# =====================================================================
+# AUTORIZACIÓN (Fase 2.2)
+# Cada ruta declara UNA política (Policy) como dependencia. Un test recorre app.routes y falla si
+# alguna ruta no tiene política. Las reglas de rol, capacidad y sucursal viven solo acá y en auth_core.
+# =====================================================================
+
+ERROR_FORBIDDEN_ROLE = "FORBIDDEN_ROLE"
+ERROR_FORBIDDEN_CAPABILITY = "FORBIDDEN_CAPABILITY"
+ERROR_FORBIDDEN_BRANCH = "FORBIDDEN_BRANCH"
+ERROR_FORBIDDEN_USER_ADMIN = "FORBIDDEN_USER_ADMIN"
+ERROR_LAST_MASTERADMIN = "LAST_MASTERADMIN"
+ERROR_DEFAULT_PASSWORD_RESET_REQUIRED = "DEFAULT_PASSWORD_RESET_REQUIRED"
+
+
+def has_capability(user: UserDB, capability: str) -> bool:
+    return auth_core.capability_allowed(user.role, capability, getattr(user, capability, False))
+
+
+def allowed_branch_ids(db: Session, user: UserDB) -> List[int]:
+    """U14=A: MASTERADMIN y SUPERADMIN, todas las sucursales activas; el resto, las asignadas."""
+    active = [b.id for b in db.query(BranchDB).filter(BranchDB.is_active == True).order_by(BranchDB.id).all()]
+    if (user.role or "").strip().lower() in auth_core.ADMIN_ROLES:
+        return active
+    assigned = {r.branch_id for r in db.query(UserBranchDB).filter(UserBranchDB.user_id == user.id).all()}
+    if not assigned:
+        assigned = {user.branch_id or 1}
+    return [b for b in active if b in assigned]
+
+
+# Compatibilidad con el nombre usado en 2.1.
+_allowed_branch_ids = allowed_branch_ids
+
+
+def require_branch_access(db: Session, ctx: "AuthContext", branch_id: int) -> int:
+    """403 FORBIDDEN_BRANCH si la sucursal no está entre las del usuario autenticado.
+
+    Para MASTERADMIN/SUPERADMIN una sucursal inexistente no se rechaza acá: el endpoint responde
+    su propio 404/422 como hasta ahora.
+    """
+    if branch_id in allowed_branch_ids(db, ctx.user):
+        return branch_id
+    if (ctx.user.role or "") in auth_core.ADMIN_ROLES and not db.query(BranchDB).filter(BranchDB.id == branch_id).first():
+        return branch_id
+    raise _auth_error(403, ERROR_FORBIDDEN_BRANCH, "No tenés acceso a esa sucursal.")
+
+
+class Policy:
+    """Política de seguridad de una ruta.
+
+    min_role: rol mínimo (jerarquía de auth_core.ROLE_LEVELS).
+    caps: capacidades can_* (alcanza una). MASTERADMIN/SUPERADMIN siempre las tienen; con
+          cap_alt_role, ese rol o superior tampoco las necesita.
+    branch: de dónde sale la sucursal a validar: "query" (branch_id, con branch_default), "path"
+            ({branch_id} en la URL) o "day_plan" (sucursal guardada del plan {plan_id}).
+    """
+
+    def __init__(self, label: str, *, public: bool = False, min_role: Optional[str] = None,
+                 caps: tuple = (), cap_alt_role: Optional[str] = None, branch: Optional[str] = None,
+                 branch_default: Optional[int] = None, allow_password_change: bool = False):
+        assert branch in (None, "query", "path", "day_plan")
+        self.label = label
+        self.public = public
+        self.min_role = min_role
+        self.caps = tuple(caps)
+        self.cap_alt_role = cap_alt_role
+        self.branch = branch
+        self.branch_default = branch_default
+        self.allow_password_change = allow_password_change
+
+    def describe(self) -> dict:
+        return {"category": self.label, "min_role": self.min_role, "capabilities": list(self.caps),
+                "capability_waived_from": self.cap_alt_role, "branch": self.branch,
+                "public": self.public, "password_change_pending_allowed": self.allow_password_change}
+
+    def _branch_id(self, request: Request, db: Session) -> Optional[int]:
+        try:
+            if self.branch == "query":
+                raw = request.query_params.get("branch_id")
+                return int(raw) if raw not in (None, "") else self.branch_default
+            if self.branch == "path":
+                return int(request.path_params["branch_id"])
+            if self.branch == "day_plan":
+                plan = db.query(DayPlanDB).filter(DayPlanDB.id == int(request.path_params["plan_id"])).first()
+                return plan.branch_id if plan else None   # inexistente: el endpoint responde 404
+        except (KeyError, ValueError, TypeError):
+            raise HTTPException(status_code=422, detail="branch_id inválido")
+        return None
+
+    def __call__(self, request: Request, db: Session = Depends(get_db)) -> Optional["AuthContext"]:
+        if self.public:
+            return None
+        ctx = _resolve_auth_context(request, db, self.allow_password_change)
+        user = ctx.user
+        level = auth_core.role_level(user.role)
+        if self.min_role and level < auth_core.role_level(self.min_role):
+            raise _auth_error(403, ERROR_FORBIDDEN_ROLE, "Tu rol no tiene acceso a esta operación.")
+        if self.caps:
+            waived = (user.role or "") in auth_core.ADMIN_ROLES or (
+                self.cap_alt_role is not None and level >= auth_core.role_level(self.cap_alt_role))
+            if not waived and not any(has_capability(user, c) for c in self.caps):
+                raise _auth_error(403, ERROR_FORBIDDEN_CAPABILITY, "No tenés permiso para este módulo.")
+        if self.branch:
+            branch_id = self._branch_id(request, db)
+            if branch_id is not None:
+                require_branch_access(db, ctx, branch_id)
+        # Identidad para el sellado de actor (before_flush) en esta misma sesión de base.
+        db.info["auth_ctx"] = ctx
+        return ctx
+
+
+def _policy(label, **kw) -> Policy:
+    return Policy(label, **kw)
+
+
+# Políticas reutilizables (las de sucursal se crean por ruta con su origen y valor por defecto).
+PUBLIC = _policy("PUBLIC", public=True)
+AUTHENTICATED_PENDING_OK = _policy("AUTHENTICATED", allow_password_change=True)
+SUPERADMIN_ONLY = _policy("SUPERADMIN", min_role="superadmin")
+MASTERADMIN_ONLY = _policy("MASTERADMIN", min_role="masteradmin")
+
+
+def employee(cap=None, alt=None, branch=None, default=1, caps=None) -> Policy:
+    caps = tuple(caps or ((cap,) if cap else ()))
+    label = "EMPLOYEE" + ("+" + "|".join(caps) if caps else "")
+    return _policy(label, min_role="vendedor", caps=caps, cap_alt_role=alt, branch=branch,
+                   branch_default=default if branch == "query" else None)
+
+
+def cashier(cap="can_caja", alt=None, branch="query", default=1, caps=None) -> Policy:
+    caps = tuple(caps or ((cap,) if cap else ()))
+    return _policy("CASHIER+" + "|".join(caps), min_role="cajero", caps=caps, cap_alt_role=alt,
+                   branch=branch, branch_default=default if branch == "query" else None)
+
+
+def manager(cap=None, branch=None, default=1) -> Policy:
+    caps = (cap,) if cap else ()
+    return _policy("MANAGER" + ("+" + cap if cap else ""), min_role="encargado", caps=caps, branch=branch,
+                   branch_default=default if branch == "query" else None)
+
+
+def owner(branch=None, default=1) -> Policy:
+    return _policy("OWNER", min_role="dueno", branch=branch,
+                   branch_default=default if branch == "query" else None)
+
+
+def route_policies() -> dict:
+    """{(MÉTODO, ruta): Policy | None} para todas las rutas de la API (inventario y test)."""
+    from fastapi.routing import APIRoute
+    out = {}
+    for route in app.routes:
+        if not isinstance(route, APIRoute):
+            continue
+        found = [d.call for d in route.dependant.dependencies if isinstance(d.call, Policy)]
+        for method in sorted(route.methods):
+            out[(method, route.path)] = found
+    return out
+
+
+# --- Actor de auditoría desde la sesión ---------------------------------------------------------
+# Campos de actor que el cliente podía declarar. Con una sesión autenticada, antes de guardar se
+# reemplazan por el email del usuario de la sesión: el valor enviado por la app no cuenta.
+ACTOR_FIELDS = {
+    "AuditEventDB": ("actor",), "StockMovementDB": ("actor",), "CashMovementDB": ("actor",),
+    "SaleDB": ("sold_by",), "PreSaleDB": ("created_by",), "ProductIngressDB": ("received_by",),
+    "CashSessionDB": ("opened_by", "closed_by"), "InventoryCountDB": ("reported_by",),
+    "PromotionDB": ("created_by",), "PriceHistoryDB": ("changed_by",), "AlertStateDB": ("resolved_by",),
+    "ProductDB": ("last_counted_by",), "DayPlanDB": ("created_by", "updated_by", "opened_by", "closed_by"),
+    "FairCostConfigDB": ("created_by",), "DayPlanSnapshotDB": ("computed_by",),
+}
+
+
+def _stamp_actor(session, flush_context, instances):
+    ctx = session.info.get("auth_ctx")
+    if ctx is None:
+        return
+    from sqlalchemy import inspect as sa_inspect
+    for obj, is_new in [(o, True) for o in session.new] + [(o, False) for o in session.dirty]:
+        fields = ACTOR_FIELDS.get(type(obj).__name__)
+        if not fields:
+            continue
+        state = sa_inspect(obj)
+        for field in fields:
+            value = getattr(obj, field, None)
+            changed = state.attrs[field].history.has_changes()
+            if (is_new and value is not None) or (not is_new and changed):
+                setattr(obj, field, ctx.actor_email)
+        if is_new and isinstance(obj, AuditEventDB):
+            obj.actor = ctx.actor_email
+            obj.actor_user_id = ctx.user.id
+            obj.actor_source = "session"
+            obj.session_id = ctx.session.id
+
+
+from sqlalchemy import event as _sa_event  # noqa: E402
+_sa_event.listen(SessionLocal, "before_flush", _stamp_actor)
 
 
 # --- Endpoints ---------------------------------------------------------------------------------
 
+# Pública: diagnóstico sin datos sensibles (no expone URL ni rutas).
+@app.get("/health")
+def health(ctx: AuthContext = Depends(PUBLIC)):
+    return database_health(DB_CONFIG, engine)
+
+
 @app.post("/login")
-def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db), ctx: AuthContext = Depends(PUBLIC)):
     now = _auth_utcnow()
     address = _client_address(request)
     email_key = _email_key(form_data.username)
@@ -1256,7 +1488,7 @@ def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db
 
 
 @app.get("/auth/me")
-def auth_me(ctx: AuthContext = Depends(require_session_allow_password_change), db: Session = Depends(get_db)):
+def auth_me(ctx: AuthContext = Depends(AUTHENTICATED_PENDING_OK), db: Session = Depends(get_db)):
     return {
         "user": serialize_user(ctx.user),
         "must_change_password": ctx.must_change_password,
@@ -1270,7 +1502,7 @@ def auth_me(ctx: AuthContext = Depends(require_session_allow_password_change), d
 
 
 @app.post("/auth/logout")
-def auth_logout(ctx: AuthContext = Depends(require_session_allow_password_change), db: Session = Depends(get_db)):
+def auth_logout(ctx: AuthContext = Depends(AUTHENTICATED_PENDING_OK), db: Session = Depends(get_db)):
     ctx.session.revoked_at = _auth_utcnow()
     ctx.session.revoked_reason = "LOGOUT"
     db.commit()
@@ -1284,10 +1516,16 @@ class ChangePasswordSchema(BaseModel):
 
 @app.post("/auth/change-password")
 def auth_change_password(payload: ChangePasswordSchema, request: Request,
-                         ctx: AuthContext = Depends(require_session_allow_password_change),
+                         ctx: AuthContext = Depends(AUTHENTICATED_PENDING_OK),
                          db: Session = Depends(get_db)):
     now = _auth_utcnow()
     user = ctx.user
+    # Una contraseña por defecto es pública (admin123 figura en el repositorio): conocerla no prueba
+    # ser el dueño de la cuenta. Desde ese estado solo se sale con el reset seguro de Render Shell.
+    if ctx.change_reason == auth_core.REASON_DEFAULT_PASSWORD:
+        raise _auth_error(403, ERROR_DEFAULT_PASSWORD_RESET_REQUIRED,
+                          "Esta cuenta usa la contraseña por defecto y no puede cambiarse desde la app. "
+                          "Pedí al administrador del sistema un reset seguro.")
     email_key = _email_key(user.email)
     address = _client_address(request)
     _check_login_limits(db, email_key, address, now)
@@ -1309,23 +1547,22 @@ def auth_change_password(payload: ChangePasswordSchema, request: Request,
     return {"status": "success", "must_change_password": False, "other_sessions_revoked": revoked}
 
 
-# ===== USUARIOS: parche de seguridad U1 (previo a la autenticación real de Fase 2.1) =====
-# Todavía no hay autenticación: estos endpoints son anónimos. Por eso:
-# - nunca devuelven contraseñas ni ningún otro secreto (lista blanca de campos);
-# - las operaciones que podrían crear o modificar administradores quedan BLOQUEADAS hasta 2.1,
-#   en lugar de "protegerlas" con datos que manda el propio cliente (rol, email, actor, headers).
+# =====================================================================
+# USUARIOS (Fase 2.2): autorización real (reemplaza los bloqueos temporales de U1)
+# U3=A: MASTERADMIN administra todo; SUPERADMIN administra hasta Dueño; Dueño y menores no
+# administran usuarios. U4=A: nadie asigna un rol >= al propio (salvo MASTERADMIN) y nadie se
+# modifica a sí mismo. U5=A: siempre queda al menos un MASTERADMIN activo.
+# =====================================================================
 
-ADMIN_LEVEL_ROLES = ("masteradmin", "superadmin")
-# Roles que un pedido anónimo puede asignar mientras no exista autenticación real.
-ANONYMOUS_ASSIGNABLE_ROLES = ("dueno", "vendedor")
-ERROR_ADMIN_OPERATION_BLOCKED = "ADMIN_OPERATION_BLOCKED_UNTIL_AUTH"
+ADMIN_LEVEL_ROLES = auth_core.ADMIN_ROLES
 
-# Único formato de salida de un usuario. Cualquier campo nuevo de UserDB (hash, token, etc.)
-# queda fuera hasta que se agregue acá explícitamente.
+# Único formato de salida de un usuario. Cualquier campo nuevo de UserDB queda fuera hasta que se
+# agregue acá explícitamente. Nunca incluye credenciales (viven en user_credentials).
 USER_PUBLIC_FIELDS = (
     "id", "name", "email", "role", "is_active", "branch_id",
     "can_preventa", "can_caja", "can_stock", "can_ingreso", "can_alertas", "can_rrhh",
     "can_mrp", "can_verificacion", "can_kpis", "can_carteleria", "can_edit_records",
+    "can_cash_privileged_outflows",
 )
 
 
@@ -1333,45 +1570,115 @@ def serialize_user(u: UserDB) -> dict:
     return {field: getattr(u, field) for field in USER_PUBLIC_FIELDS}
 
 
-def _is_admin_level_user(u: UserDB) -> bool:
-    return (u.role or "") in ADMIN_LEVEL_ROLES or (u.email or "").strip().lower() == MASTER_ADMIN_EMAIL
+def assigned_branch_ids(db: Session, user: UserDB) -> List[int]:
+    rows = sorted({r.branch_id for r in db.query(UserBranchDB).filter(UserBranchDB.user_id == user.id).all()})
+    return rows or [user.branch_id or 1]
 
 
-def _admin_operation_blocked(detail: str) -> HTTPException:
-    return _coded_error(403, ERROR_ADMIN_OPERATION_BLOCKED,
-                        detail + " Esta operación se habilita con el inicio de sesión real (Fase 2.1).")
+def visible_user_ids(db: Session, ctx: AuthContext) -> Optional[set]:
+    """None = todos (MASTERADMIN/SUPERADMIN). Si no, usuarios que comparten alguna sucursal."""
+    if (ctx.user.role or "") in ADMIN_LEVEL_ROLES:
+        return None
+    mine = set(allowed_branch_ids(db, ctx.user))
+    visible = {ctx.user.id}
+    for user in db.query(UserDB).all():
+        if (user.role or "") not in ADMIN_LEVEL_ROLES and mine & set(assigned_branch_ids(db, user)):
+            visible.add(user.id)
+    return visible
+
+
+def _user_admin_error(detail: str) -> HTTPException:
+    return _auth_error(403, ERROR_FORBIDDEN_USER_ADMIN, detail)
+
+
+def _require_can_manage(ctx: AuthContext, target: UserDB):
+    reason = auth_core.can_manage_user(ctx.user.role, ctx.user.id, target.role, target.id)
+    if reason:
+        raise _user_admin_error(reason)
+
+
+def _require_role_assignment(ctx: AuthContext, target: Optional[UserDB], new_role: str):
+    if (new_role or "").strip().lower() not in auth_core.ROLE_LEVELS:
+        raise HTTPException(status_code=400, detail="Rol invalido")
+    reason = auth_core.can_assign_role(ctx.user.role, ctx.user.id, target.id if target else None,
+                                       target.role if target else None, new_role)
+    if reason:
+        raise _user_admin_error(reason)
+
+
+def active_masteradmin_ids(db: Session) -> set:
+    return {u.id for u in db.query(UserDB).filter(UserDB.role == "masteradmin", UserDB.is_active == True).all()}
+
+
+def guard_last_masteradmin(db: Session, target: UserDB, role_after: Optional[str], active_after: bool):
+    if (target.role or "") != "masteradmin":
+        return
+    if auth_core.violates_last_masteradmin(active_masteradmin_ids(db), target.id, role_after, active_after):
+        raise _auth_error(409, ERROR_LAST_MASTERADMIN, "Debe quedar al menos un MASTERADMIN activo.")
+
+
+def _validated_branch_ids(db: Session, branch_ids) -> List[int]:
+    ids = sorted({int(b) for b in branch_ids})
+    active = {b.id for b in db.query(BranchDB).filter(BranchDB.is_active == True).all()}
+    if not ids or any(b not in active for b in ids):
+        raise HTTPException(status_code=400, detail="Sucursal invalida")
+    return ids
+
+
+def _set_user_branches(db: Session, user: UserDB, branch_ids: List[int], default_branch: Optional[int] = None):
+    db.query(UserBranchDB).filter(UserBranchDB.user_id == user.id).delete(synchronize_session=False)
+    for branch_id in branch_ids:
+        db.add(UserBranchDB(user_id=user.id, branch_id=branch_id))
+    user.branch_id = default_branch if default_branch in branch_ids else branch_ids[0]
+
+
+def _get_user_or_404(db: Session, user_id: int) -> UserDB:
+    user = db.query(UserDB).filter(UserDB.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return user
+
+
+def _audit_user_change(db: Session, user: UserDB, field: str, old, new, reason: str):
+    # actor, actor_user_id, actor_source y session_id los completa el sellado desde la sesión.
+    db.add(AuditEventDB(entity_type="user", entity_id=user.id, field_name=field,
+                        old_value=None if old is None else str(old), new_value=None if new is None else str(new),
+                        reason=reason))
 
 
 @app.get("/users")
-def get_users(db: Session = Depends(get_db)):
-    return [serialize_user(u) for u in db.query(UserDB).all()]
+def get_users(db: Session = Depends(get_db), ctx: AuthContext = Depends(employee(caps=("can_rrhh",), alt="dueno"))):
+    visible = visible_user_ids(db, ctx)
+    return [serialize_user(u) for u in db.query(UserDB).order_by(UserDB.id).all()
+            if visible is None or u.id in visible]
 
 @app.post("/users")
-def create_user(user_data: dict, db: Session = Depends(get_db)):
+def create_user(user_data: dict, db: Session = Depends(get_db), ctx: AuthContext = Depends(SUPERADMIN_ONLY)):
     name = str(user_data.get("name") or "").strip()
     email = str(user_data.get("email") or "").strip()
     password = user_data.get("password")
     if not name or not email or not isinstance(password, str) or not password:
         raise HTTPException(status_code=422, detail="Nombre, email y contraseña son obligatorios")
 
-    # Sin autenticación, un pedido anónimo solo puede crear empleados (rol vendedor).
     role = user_data.get("role")
-    role = "vendedor" if role is None or str(role).strip() == "" else str(role).strip()
-    if role != "vendedor":
-        raise _admin_operation_blocked("No se pueden crear usuarios con rol administrativo.")
+    role = "vendedor" if role is None or str(role).strip() == "" else str(role).strip().lower()
+    _require_role_assignment(ctx, None, role)
 
-    # Emails únicos sin distinguir mayúsculas: evita, entre otras cosas, una variante del email
-    # de la cuenta maestra (el login la promueve a masteradmin comparando en minúsculas).
     lowered = email.lower()
     if lowered == MASTER_ADMIN_EMAIL or db.query(UserDB).filter(func.lower(UserDB.email) == lowered).first():
         raise HTTPException(status_code=409, detail="Ya existe un usuario con ese email")
 
-    # Fase 2.1: la contraseña inicial cumple la política y se guarda SOLO como hash; la columna
-    # heredada recibe un valor inutilizable. El usuario debe cambiarla en su primer ingreso.
+    # La contraseña inicial cumple la política y se guarda SOLO como hash; se cambia en el primer ingreso.
     violation = auth_core.check_password_policy(password, email)
     if violation:
         raise _auth_error(422, ERROR_PASSWORD_POLICY, violation.message, {"X-Policy-Code": violation.code})
 
+    if user_data.get("branch_ids") is not None:
+        branch_ids = _validated_branch_ids(db, user_data["branch_ids"])
+    else:
+        branch_ids = _validated_branch_ids(db, [user_data.get("branch_id") or 1])
+
+    privileged_default = role in ("superadmin", "dueno")
     new_u = UserDB(
         name=name,
         email=email,
@@ -1380,63 +1687,87 @@ def create_user(user_data: dict, db: Session = Depends(get_db)):
         is_active=False,
         can_preventa=True, can_caja=False, can_stock=False, can_ingreso=False,
         can_alertas=False, can_rrhh=False, can_mrp=False, can_verificacion=False, can_kpis=False,
-        can_carteleria=bool(user_data.get("can_carteleria", False)),
-        can_edit_records=False,
-        branch_id=int(user_data.get("branch_id", 1) or 1)
+        can_carteleria=bool(user_data.get("can_carteleria", privileged_default)),
+        can_edit_records=privileged_default,
+        can_cash_privileged_outflows=False,
     )
     db.add(new_u); db.flush()
-    set_user_password(db, new_u, password, must_change=True, reason=auth_core.REASON_INITIAL,
-                      now=_auth_utcnow())
+    _set_user_branches(db, new_u, branch_ids, user_data.get("branch_id"))
+    set_user_password(db, new_u, password, must_change=True, reason=auth_core.REASON_INITIAL, now=_auth_utcnow())
+    _audit_user_change(db, new_u, "created", None, role, "Alta de usuario")
     db.commit(); db.refresh(new_u)
     return serialize_user(new_u)
 
 @app.patch("/users/{user_id}/permissions")
-def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends(get_db)):
-    u=db.query(UserDB).filter(UserDB.id==user_id).first()
-    if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
-
-    # Ningún pedido anónimo modifica a un MASTERADMIN o SUPERADMIN (rol, estado, permisos ni sucursal).
-    if _is_admin_level_user(u):
-        raise _admin_operation_blocked("No se pueden modificar usuarios MASTERADMIN o SUPERADMIN.")
+def update_permissions(user_id: int, p: PermissionsSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(SUPERADMIN_ONLY)):
+    u = _get_user_or_404(db, user_id)
+    _require_can_manage(ctx, u)
+    now = _auth_utcnow()
 
     if p.role is not None:
-        if p.role in ADMIN_LEVEL_ROLES:
-            raise _admin_operation_blocked("No se puede asignar un rol administrativo.")
-        if p.role not in ANONYMOUS_ASSIGNABLE_ROLES:
-            raise HTTPException(status_code=400, detail="Rol invalido")
-    if p.branch_id is not None and p.branch_id not in (1, 2):
-        raise HTTPException(status_code=400, detail="Sucursal invalida")
+        new_role = p.role.strip().lower()
+        _require_role_assignment(ctx, u, new_role)
+        guard_last_masteradmin(db, u, new_role, bool(u.is_active) if p.is_active is None else p.is_active)
+    if p.is_active is False:
+        guard_last_masteradmin(db, u, (p.role or u.role), False)
 
-    if p.role is not None: u.role=p.role
-    if p.is_active is not None:
-        u.is_active=p.is_active
+    if p.role is not None and p.role.strip().lower() != u.role:
+        _audit_user_change(db, u, "role", u.role, p.role.strip().lower(), "Cambio de rol")
+        u.role = p.role.strip().lower()
+    if p.is_active is not None and p.is_active != bool(u.is_active):
+        _audit_user_change(db, u, "is_active", bool(u.is_active), p.is_active, "Cambio de estado")
+        u.is_active = p.is_active
         if not p.is_active:
-            revoke_user_sessions(db, u.id, "USER_DISABLED", _auth_utcnow())
-    if p.can_preventa is not None: u.can_preventa=p.can_preventa
-    if p.can_caja is not None: u.can_caja=p.can_caja
-    if p.can_stock is not None: u.can_stock=p.can_stock
-    if p.can_ingreso is not None: u.can_ingreso=p.can_ingreso
-    if p.can_alertas is not None: u.can_alertas=p.can_alertas
-    if p.can_rrhh is not None: u.can_rrhh=p.can_rrhh
-    if p.can_mrp is not None: u.can_mrp=p.can_mrp
-    if p.can_verificacion is not None: u.can_verificacion=p.can_verificacion
-    if p.can_kpis is not None: u.can_kpis=p.can_kpis
-    if p.can_carteleria is not None: u.can_carteleria=p.can_carteleria
-    if p.can_edit_records is not None: u.can_edit_records=p.can_edit_records
-    if p.branch_id is not None: u.branch_id=p.branch_id
-    db.commit(); db.refresh(u); return serialize_user(u)
+            revoke_user_sessions(db, u.id, "USER_DISABLED", now)
+    for cap in auth_core.CAPABILITIES:
+        value = getattr(p, cap, None)
+        if value is not None and value != bool(getattr(u, cap)):
+            _audit_user_change(db, u, cap, bool(getattr(u, cap)), value, "Cambio de permiso")
+            setattr(u, cap, value)
+    if p.branch_ids is not None or p.branch_id is not None:
+        ids = _validated_branch_ids(db, p.branch_ids if p.branch_ids is not None else [p.branch_id])
+        old = assigned_branch_ids(db, u)
+        _set_user_branches(db, u, ids, p.branch_id)
+        if old != ids:
+            _audit_user_change(db, u, "branch_ids", old, ids, "Cambio de sucursales")
+    db.commit(); db.refresh(u)
+    return serialize_user(u)
 
 @app.patch("/users/{user_id}/status")
-def update_user_status(user_id: int, payload: UserStatusSchema, db: Session=Depends(get_db)):
-    u=db.query(UserDB).filter(UserDB.id==user_id).first()
-    if not u: raise HTTPException(status_code=404,detail="Usuario no encontrado")
-    if _is_admin_level_user(u):
-        raise _admin_operation_blocked("No se puede habilitar ni deshabilitar a un MASTERADMIN o SUPERADMIN.")
-    u.is_active=payload.is_active
+def update_user_status(user_id: int, payload: UserStatusSchema, db: Session=Depends(get_db), ctx: AuthContext = Depends(SUPERADMIN_ONLY)):
+    u = _get_user_or_404(db, user_id)
+    _require_can_manage(ctx, u)
+    if not payload.is_active:
+        guard_last_masteradmin(db, u, u.role, False)
+    if payload.is_active != bool(u.is_active):
+        _audit_user_change(db, u, "is_active", bool(u.is_active), payload.is_active, "Cambio de estado")
+    u.is_active = payload.is_active
     if not payload.is_active:
         revoke_user_sessions(db, u.id, "USER_DISABLED", _auth_utcnow())
     db.commit()
     return {"status":"success","user_id":u.id,"is_active":u.is_active}
+
+@app.post("/users/{user_id}/reset-password")
+def reset_user_password(user_id: int, response: Response, db: Session = Depends(get_db),
+                        ctx: AuthContext = Depends(SUPERADMIN_ONLY)):
+    """Contraseña temporal para un usuario administrado (U13=A).
+
+    La contraseña temporal se devuelve UNA sola vez en esta respuesta (no se guarda en claro ni en
+    logs), obliga a cambiarla en el próximo ingreso y cierra todas las sesiones del usuario.
+    Para la propia cuenta se usa /auth/change-password; para el MASTERADMIN sin acceso, Render Shell.
+    """
+    u = _get_user_or_404(db, user_id)
+    _require_can_manage(ctx, u)
+    now = _auth_utcnow()
+    temporary = auth_core.generate_temporary_password()
+    set_user_password(db, u, temporary, must_change=True, reason=auth_core.REASON_TEMPORARY, now=now)
+    revoked = revoke_user_sessions(db, u.id, "PASSWORD_RESET", now)
+    _clear_login_failures(db, _email_key(u.email))
+    _audit_user_change(db, u, "password", None, None, f"Contraseña temporal; sesiones cerradas: {revoked}")
+    db.commit()
+    response.headers["Cache-Control"] = "no-store"
+    return {"user": serialize_user(u), "temporary_password": temporary, "must_change_password": True,
+            "sessions_revoked": revoked}
 
 def _kpi_period(period: str):
     now=datetime.datetime.utcnow()
@@ -1517,13 +1848,13 @@ def build_profitability(start: datetime.datetime, end: datetime.datetime, db: Se
     }
 
 @app.get("/kpis/profitability")
-def get_profitability(period: str="month", branch_id: int=1, db: Session=Depends(get_db)):
+def get_profitability(period: str="month", branch_id: int=1, db: Session=Depends(get_db), ctx: AuthContext = Depends(employee("can_kpis", alt="dueno", branch="query"))):
     start,end,label=_kpi_period(period)
     data=build_profitability(start,end,db,branch_id)
     return {"period":label,"from":start.isoformat(),"to":end.isoformat(),**data}
 
 @app.get("/kpis/dashboard")
-def get_kpis_dashboard(period: str="month", branch_id: int=1, db: Session=Depends(get_db)):
+def get_kpis_dashboard(period: str="month", branch_id: int=1, db: Session=Depends(get_db), ctx: AuthContext = Depends(employee("can_kpis", alt="dueno", branch="query"))):
     start,end,label=_kpi_period(period)
     data=build_profitability(start,end,db,branch_id)
     top=db.query(SaleItemDB.product_name,func.sum(SaleItemDB.quantity).label("qty")).join(SaleDB).filter(
@@ -1544,19 +1875,38 @@ def get_kpis_dashboard(period: str="month", branch_id: int=1, db: Session=Depend
         **data
     }
 
-@app.post("/hr/shifts/start")
-def start_shift(payload: ShiftStartSchema, db: Session=Depends(get_db)):
-    user=db.query(UserDB).filter(UserDB.id==payload.user_id).first()
+def _shift_target(db: Session, ctx: AuthContext, user_id: int) -> UserDB:
+    """U16=A: cada uno maneja su propio turno; el de otro requiere Encargado o superior + can_rrhh
+    y que el empleado sea visible (comparte sucursal)."""
+    user=db.query(UserDB).filter(UserDB.id==user_id).first()
     if not user: raise HTTPException(status_code=404,detail="Empleado no encontrado")
+    if user.id == ctx.user.id:
+        return user
+    if auth_core.role_level(ctx.user.role) < auth_core.role_level("encargado") or not has_capability(ctx.user, "can_rrhh"):
+        raise _auth_error(403, ERROR_FORBIDDEN_ROLE, "Solo un Encargado o superior con permiso de RRHH maneja turnos de otros.")
+    visible = visible_user_ids(db, ctx)
+    if visible is not None and user.id not in visible:
+        raise _auth_error(403, ERROR_FORBIDDEN_BRANCH, "Ese empleado no pertenece a tus sucursales.")
+    return user
+
+
+@app.post("/hr/shifts/start")
+def start_shift(payload: ShiftStartSchema, db: Session=Depends(get_db), ctx: AuthContext = Depends(employee())):
+    user=_shift_target(db, ctx, payload.user_id)
     if not user.is_active: raise HTTPException(status_code=403,detail="El usuario esta inhabilitado")
     current=db.query(WorkLogDB).filter(WorkLogDB.user_id==user.id,WorkLogDB.clock_out==None).order_by(WorkLogDB.id.desc()).first()
     if current: raise HTTPException(status_code=409,detail="El empleado ya tiene un turno abierto")
-    log=WorkLogDB(user_id=user.id,user_name=user.name,user_email=user.email,clock_in=datetime.datetime.utcnow(),role_worked=payload.role_worked or user.role)
+    # El rol trabajado no puede superar el rol real del empleado.
+    role_worked = payload.role_worked or user.role
+    if auth_core.role_level(role_worked) > auth_core.role_level(user.role):
+        role_worked = user.role
+    log=WorkLogDB(user_id=user.id,user_name=user.name,user_email=user.email,clock_in=datetime.datetime.utcnow(),role_worked=role_worked)
     db.add(log); db.commit(); db.refresh(log)
     return {"status":"success","shift_id":log.id,"user_id":user.id,"role_worked":log.role_worked}
 
 @app.post("/hr/shifts/end")
-def end_shift(payload: ShiftEndSchema, db: Session=Depends(get_db)):
+def end_shift(payload: ShiftEndSchema, db: Session=Depends(get_db), ctx: AuthContext = Depends(employee())):
+    _shift_target(db, ctx, payload.user_id)
     log=db.query(WorkLogDB).filter(WorkLogDB.user_id==payload.user_id,WorkLogDB.clock_out==None).order_by(WorkLogDB.id.desc()).first()
     if not log: raise HTTPException(status_code=404,detail="No hay turno abierto para ese empleado")
     now=datetime.datetime.utcnow(); log.clock_out=now
@@ -1565,15 +1915,18 @@ def end_shift(payload: ShiftEndSchema, db: Session=Depends(get_db)):
     return {"status":"success","shift_id":log.id,"hours_worked":log.hours_worked}
 
 @app.get("/hr/shifts/active")
-def active_shifts(db: Session=Depends(get_db)):
-    return db.query(WorkLogDB).filter(WorkLogDB.clock_out==None).order_by(WorkLogDB.clock_in.asc()).all()
+def active_shifts(db: Session=Depends(get_db), ctx: AuthContext = Depends(employee("can_rrhh", alt="dueno"))):
+    visible = visible_user_ids(db, ctx)
+    return [l for l in db.query(WorkLogDB).filter(WorkLogDB.clock_out==None).order_by(WorkLogDB.clock_in.asc()).all()
+            if visible is None or l.user_id in visible]
 
 @app.get("/hr/worklogs")
-def get_worklogs(email: Optional[str]=None, days: Optional[int]=None, db: Session=Depends(get_db)):
+def get_worklogs(email: Optional[str]=None, days: Optional[int]=None, db: Session=Depends(get_db), ctx: AuthContext = Depends(employee("can_rrhh", alt="dueno"))):
     q=db.query(WorkLogDB)
     if email: q=q.filter(WorkLogDB.user_email==email)
     if days and days>0: q=q.filter(WorkLogDB.clock_in>=datetime.datetime.utcnow()-datetime.timedelta(days=days))
-    logs=q.order_by(WorkLogDB.id.desc()).all()
+    visible = visible_user_ids(db, ctx)
+    logs=[l for l in q.order_by(WorkLogDB.id.desc()).all() if visible is None or l.user_id in visible]
     return [{"id":l.id,"user_id":l.user_id,"user_name":l.user_name,"user_email":l.user_email,"role_worked":l.role_worked,"date":l.clock_in.strftime("%Y-%m-%d"),"clock_in":l.clock_in.strftime("%H:%M hs"),"clock_out":l.clock_out.strftime("%H:%M hs") if l.clock_out else "En jornada","hours_worked":l.hours_worked} for l in logs]
 
 def get_employee_stats(email: str, days: int, db: Session):
@@ -1593,18 +1946,29 @@ def get_employee_stats(email: str, days: int, db: Session):
     losses=db.query(StockMovementDB).filter(StockMovementDB.actor==email,StockMovementDB.movement_type=="LOSS",StockMovementDB.created_at>=since).count()
     return {"email":email,"name":user.name if user else email,"account_enabled":user.is_active if user else None,"current_role":user.role if user else None,"roles_worked":roles,"days":days,"shifts_count":len(work),"total_hours":round(hours,2),"sales_count":len(sales),"total_revenue":round(revenue,2),"ticket_avg":round(revenue/max(1,len(sales)),2),"presales_count":presales,"cash_operations":cash_ops,"stock_loss_operations":losses}
 
+def _visible_emails(db: Session, ctx: AuthContext) -> Optional[set]:
+    visible = visible_user_ids(db, ctx)
+    if visible is None:
+        return None
+    return {u.email for u in db.query(UserDB).filter(UserDB.id.in_(visible)).all()}
+
+
 @app.get("/hr/performance")
-def get_performance(email: str, days: int=30, db: Session=Depends(get_db)):
+def get_performance(email: str, days: int=30, db: Session=Depends(get_db), ctx: AuthContext = Depends(employee("can_rrhh", alt="dueno"))):
+    emails = _visible_emails(db, ctx)
+    if emails is not None and email not in emails:
+        raise _auth_error(403, ERROR_FORBIDDEN_BRANCH, "Ese empleado no pertenece a tus sucursales.")
     return get_employee_stats(email,days,db)
 
 @app.get("/hr/compare")
-def compare_employees(emails: str="", days: int=30, db: Session=Depends(get_db), email1: Optional[str]=None, email2: Optional[str]=None):
+def compare_employees(emails: str="", days: int=30, db: Session=Depends(get_db), email1: Optional[str]=None, email2: Optional[str]=None, ctx: AuthContext = Depends(employee("can_rrhh", alt="dueno"))):
     selected=[x.strip() for x in emails.split(",") if x.strip()]
     if not selected: selected=[x for x in (email1,email2) if x]
     if not selected: selected=[u.email for u in db.query(UserDB).order_by(UserDB.name.asc()).all()]
+    visible = _visible_emails(db, ctx)
     unique=[]
     for email in selected:
-        if email not in unique: unique.append(email)
+        if email not in unique and (visible is None or email in visible): unique.append(email)
     return {"days":days,"count":len(unique),"employees":[get_employee_stats(email,days,db) for email in unique]}
 
 def branch_product_view(product: ProductDB, branch_id: int, db: Session):
@@ -1641,7 +2005,7 @@ def branch_product_view(product: ProductDB, branch_id: int, db: Session):
     return data
 
 @app.get("/products")
-def get_products(branch_id: int = 1, db: Session = Depends(get_db)):
+def get_products(branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee(branch="query"))):
     products = db.query(ProductDB).filter(ProductDB.is_active == True).order_by(ProductDB.name.asc()).all()
     result = []
     for product in products:
@@ -1655,7 +2019,7 @@ def get_products(branch_id: int = 1, db: Session = Depends(get_db)):
 def get_master_product_by_barcode(
     barcode: str,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(employee())):
     clean = barcode.strip()
 
     product = db.query(ProductDB).filter(
@@ -1675,7 +2039,7 @@ def get_master_product_by_barcode(
     }
 
 @app.get("/products/by-barcode/{barcode}")
-def get_product_by_barcode(barcode: str, branch_id: int = 1, db: Session = Depends(get_db)):
+def get_product_by_barcode(barcode: str, branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee(branch="query"))):
     product = db.query(ProductDB).filter(ProductDB.barcode == barcode.strip()).first()
     if not product:
         raise HTTPException(status_code=404, detail="EAN no asociado a ningun producto")
@@ -1688,7 +2052,7 @@ def get_product_by_barcode(barcode: str, branch_id: int = 1, db: Session = Depen
     return view
 
 @app.get("/products/search")
-def search_products(q: str = "", branch_id: int = 1, db: Session = Depends(get_db)):
+def search_products(q: str = "", branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee(branch="query"))):
     query = db.query(ProductDB).filter(ProductDB.is_active == True)
 
     if q.strip():
@@ -1730,7 +2094,7 @@ def register_ingress(product: ProductDB, supplier: Optional[str], cost_price: fl
     return ing,lot
 
 @app.get("/branches/{branch_id}/products")
-def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db)):
+def get_branch_product_admin(branch_id: int, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee("can_stock", alt="encargado", branch="path"))):
     branch = db.query(BranchDB).filter(
         BranchDB.id == branch_id,
         BranchDB.is_active == True
@@ -1851,7 +2215,7 @@ def _format_qty(qty: float, unit_type: Optional[str]) -> str:
 
 
 @app.get("/branches/{branch_id}/products/{product_id}/retire-preview")
-def preview_retire_branch_product(branch_id: int, product_id: int, db: Session = Depends(get_db)):
+def preview_retire_branch_product(branch_id: int, product_id: int, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee("can_stock", alt="encargado", branch="path"))):
     """Qué pasaría al retirar el producto de la sucursal (no modifica nada)."""
     branch = _get_active_branch_or_404(db, branch_id)
     product = db.query(ProductDB).filter(ProductDB.id == product_id).first()
@@ -1879,7 +2243,7 @@ def configure_branch_product(
     product_id: int,
     payload: BranchProductConfigSchema,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(owner(branch="path"))):
     branch = db.query(BranchDB).filter(
         BranchDB.id == branch_id,
         BranchDB.is_active == True
@@ -1965,7 +2329,7 @@ def remove_product_from_branch(
     actor: Optional[str] = None,
     reason: Optional[str] = None,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(owner(branch="path"))):
     """Retirar de sucursal: solo is_available=false en ESA sucursal.
 
     No borra el producto maestro, ni partidas, ni movimientos, ni historial. Si la sucursal
@@ -2037,7 +2401,7 @@ def reactivate_branch_product(
     product_id: int,
     payload: Optional[BranchProductActionSchema] = None,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(owner(branch="path"))):
     """Vuelve a habilitar en la sucursal un producto RETIRADO, con su precio de sucursal ya configurado."""
     branch = _get_active_branch_or_404(db, branch_id)
     product = db.query(ProductDB).filter(ProductDB.id == product_id, ProductDB.is_active == True).first()
@@ -2076,7 +2440,7 @@ def create_product_master(
     prod: ProductMasterSchema,
     branch_id: int = 1,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(employee("can_ingreso", alt="dueno", branch="query"))):
     barcode = normalize_barcode(prod.barcode)
 
     if barcode and db.query(ProductDB).filter(
@@ -2160,7 +2524,7 @@ def create_product_master(
 # ==========================================
 
 @app.get("/promotions")
-def get_promotions(branch_id: int = 1, db: Session = Depends(get_db)):
+def get_promotions(branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee(branch="query"))):
     branch = db.query(BranchDB).filter(BranchDB.id == branch_id, BranchDB.is_active == True).first()
     if not branch:
         raise HTTPException(status_code=404, detail="Sucursal no encontrada")
@@ -2207,7 +2571,7 @@ def get_promotions(branch_id: int = 1, db: Session = Depends(get_db)):
     return result
 
 @app.get("/promotions/{promotion_id}")
-def get_promotion_detail(promotion_id: int, branch_id: int = 1, db: Session = Depends(get_db)):
+def get_promotion_detail(promotion_id: int, branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee(branch="query"))):
     promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
     if not promo:
         raise HTTPException(status_code=404, detail="Promoción no encontrada")
@@ -2263,7 +2627,7 @@ def _validate_promotion_branches(branch_configs: List[PromotionBranchConfigSchem
         )
 
 @app.post("/promotions")
-def create_promotion(payload: PromotionCreateSchema, db: Session = Depends(get_db)):
+def create_promotion(payload: PromotionCreateSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(SUPERADMIN_ONLY)):
     _validate_promotion_branches(payload.branch_configs)
 
     promo = PromotionDB(
@@ -2309,7 +2673,7 @@ def create_promotion(payload: PromotionCreateSchema, db: Session = Depends(get_d
     return {"status": "success", "promotion_id": promo.id}
 
 @app.put("/promotions/{promotion_id}")
-def update_promotion(promotion_id: int, payload: PromotionUpdateSchema, db: Session = Depends(get_db)):
+def update_promotion(promotion_id: int, payload: PromotionUpdateSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(SUPERADMIN_ONLY)):
     promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
     if not promo:
         raise HTTPException(status_code=404, detail="Promoción no encontrada")
@@ -2358,7 +2722,7 @@ def update_promotion(promotion_id: int, payload: PromotionUpdateSchema, db: Sess
     return {"status": "success", "promotion_id": promo.id}
 
 @app.delete("/promotions/{promotion_id}")
-def delete_promotion(promotion_id: int, db: Session = Depends(get_db)):
+def delete_promotion(promotion_id: int, db: Session = Depends(get_db), ctx: AuthContext = Depends(SUPERADMIN_ONLY)):
     promo = db.query(PromotionDB).filter(PromotionDB.id == promotion_id).first()
     if not promo:
         raise HTTPException(status_code=404, detail="Promoción no encontrada")
@@ -2470,7 +2834,7 @@ def _calculate_promotion_breakdown(promotion_id: int, branch_id: int, items_inpu
     return expected_total, calculated_items, regular_actual_total
 
 @app.post("/promotions/{promotion_id}/calculate")
-def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: PromotionCalculateRequestSchema = None, db: Session = Depends(get_db)):
+def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: PromotionCalculateRequestSchema = None, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee(caps=("can_caja", "can_preventa"), alt="dueno", branch="query"))):
     items_input = [ItemSchema(product_id=i.product_id, quantity=i.actual_qty) for i in (payload.items if payload else [])]
     expected_total, calculated_items, regular_actual_total = _calculate_promotion_breakdown(promotion_id, branch_id, items_input, db)
     
@@ -2507,7 +2871,7 @@ def calculate_promotion(promotion_id: int, branch_id: int = 1, payload: Promotio
 # ==========================================
 
 @app.post("/ingresses")
-def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee("can_ingreso", branch="query"))):
     product=db.query(ProductDB).filter(ProductDB.id==payload.product_id).first()
     if not product:
         raise HTTPException(status_code=404, detail="Producto no encontrado")
@@ -2560,7 +2924,7 @@ def create_ingress(payload: IngressCreateSchema, branch_id: int = 1, db: Session
     return {"status":"success","ingress_id":ing.id,"lot_id":lot.id,"product_id":product.id,"stock":product.stock}
 
 @app.get("/ingresses")
-def get_ingresses(product_id: Optional[int]=None, branch_id: int = 1, db: Session=Depends(get_db)):
+def get_ingresses(product_id: Optional[int]=None, branch_id: int = 1, db: Session=Depends(get_db), ctx: AuthContext = Depends(employee("can_ingreso", alt="dueno", branch="query"))):
     q=db.query(ProductIngressDB).filter(ProductIngressDB.branch_id==branch_id)
     if product_id is not None: q=q.filter(ProductIngressDB.product_id==product_id)
     return q.order_by(ProductIngressDB.id.desc()).limit(200).all()
@@ -2573,7 +2937,7 @@ def get_ingresses_history(
     date_to: Optional[str] = None,
     limit: int = 100,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(employee("can_ingreso", alt="dueno", branch="query"))):
     safe_limit = min(max(limit, 1), 500)
     query = db.query(ProductIngressDB).join(ProductDB, ProductIngressDB.product_id == ProductDB.id).filter(ProductIngressDB.branch_id == branch_id)
 
@@ -2625,7 +2989,7 @@ def correct_ingress(
     payload: IngressCorrectionSchema,
     branch_id: int = 1,
     db: Session=Depends(get_db)
-):
+, ctx: AuthContext = Depends(employee("can_edit_records", alt="dueno", branch="query"))):
     if not payload.reason.strip():
         raise HTTPException(status_code=422,detail="El motivo de la correccion es obligatorio")
 
@@ -2681,13 +3045,14 @@ def correct_ingress(
     return {"status":"success","ingress_id":ing.id,"product_id":product.id,"lot_id":lot.id,"stock":product.stock,"changes":[{"field":f,"old":o,"new":n} for f,o,n in changes]}
 
 @app.get("/stock/movements")
-def get_stock_movements(product_id: Optional[int]=None, db: Session=Depends(get_db)):
-    q=db.query(StockMovementDB)
+def get_stock_movements(product_id: Optional[int]=None, branch_id: int = 1, db: Session=Depends(get_db), ctx: AuthContext = Depends(owner(branch="query"))):
+    # Fase 2.2: solo los movimientos de la sucursal autorizada (antes mezclaba todas).
+    q=db.query(StockMovementDB).filter(StockMovementDB.branch_id==branch_id)
     if product_id is not None: q=q.filter(StockMovementDB.product_id==product_id)
     return q.order_by(StockMovementDB.id.desc()).limit(500).all()
 
 @app.post("/products")
-def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db)):
+def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(MASTERADMIN_ONLY)):
     barcode=normalize_barcode(prod.barcode)
     existing=db.query(ProductDB).filter(ProductDB.barcode==barcode).first() if barcode else None
     if not existing: existing=db.query(ProductDB).filter(func.lower(ProductDB.name)==prod.name.strip().lower()).first()
@@ -2712,7 +3077,7 @@ def create_product(prod: ProductCreateSchema, db: Session = Depends(get_db)):
     db.commit(); db.refresh(target); return target
 
 @app.put("/products/{product_id}")
-def update_product(product_id:int, prod:ProductCreateSchema, db:Session=Depends(get_db)):
+def update_product(product_id:int, prod:ProductCreateSchema, db:Session=Depends(get_db), ctx: AuthContext = Depends(employee("can_edit_records", alt="dueno"))):
     x=db.query(ProductDB).filter(ProductDB.id==product_id).first()
     if not x: raise HTTPException(status_code=404,detail="Producto no encontrado")
     barcode=normalize_barcode(prod.barcode)
@@ -2746,7 +3111,7 @@ def update_product(product_id:int, prod:ProductCreateSchema, db:Session=Depends(
     db.commit(); db.refresh(x); return x
 
 @app.get("/products/{product_id}/lots")
-def get_product_lots(product_id:int,branch_id: int = 1,db:Session=Depends(get_db)):
+def get_product_lots(product_id:int,branch_id: int = 1,db:Session=Depends(get_db), ctx: AuthContext = Depends(employee(branch="query"))):
     lots=db.query(ProductLotDB).filter(ProductLotDB.product_id==product_id,ProductLotDB.branch_id==branch_id,ProductLotDB.current_qty>0).order_by(ProductLotDB.expiration_date.is_(None),ProductLotDB.expiration_date.asc(),ProductLotDB.created_at.asc()).all()
     return [{"id":l.id,"lot_number":l.lot_number,"supplier":l.supplier,"cost_price":l.cost_price,"initial_qty":l.initial_qty,"current_qty":l.current_qty,"expiration_date":format_iso_to_ddmmyyyy(l.expiration_date)} for l in lots]
 
@@ -2756,7 +3121,7 @@ def audit_product_stock(
     audit: AuditSchema,
     branch_id: int = 1,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(employee("can_stock", branch="query"))):
     x = db.query(ProductDB).filter(ProductDB.id == product_id).first()
 
     if not x:
@@ -2851,7 +3216,7 @@ def get_latest_product_audit(
     product_id: int,
     branch_id: int = 1,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(employee("can_stock", alt="encargado", branch="query"))):
     latest = db.query(InventoryCountDB).filter(
         InventoryCountDB.product_id == product_id,
         InventoryCountDB.branch_id == branch_id
@@ -2879,13 +3244,13 @@ def get_latest_product_audit(
     }
 
 @app.delete("/products/{product_id}")
-def delete_product(product_id:int,db:Session=Depends(get_db)):
+def delete_product(product_id:int,db:Session=Depends(get_db), ctx: AuthContext = Depends(SUPERADMIN_ONLY)):
     x=db.query(ProductDB).filter(ProductDB.id==product_id).first()
     if not x: raise HTTPException(status_code=404,detail="No encontrado")
     x.is_active=False; db.commit(); return {"status":"ok"}
 
 @app.post("/presales")
-def create_presale(payload: PreSaleCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+def create_presale(payload: PreSaleCreateSchema, branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee("can_preventa", branch="query"))):
     total = 0.0
     presale = PreSaleDB(branch_id=branch_id, status="PENDIENTE", created_by=payload.created_by)
     db.add(presale); db.flush()
@@ -2925,7 +3290,7 @@ def create_presale(payload: PreSaleCreateSchema, branch_id: int = 1, db: Session
     return {"status": "success", "presale_id": presale.id, "total": total}
 
 @app.get("/presales/pending")
-def get_pending_presales(branch_id: int = 1, db: Session = Depends(get_db)):
+def get_pending_presales(branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(cashier())):
     presales = db.query(PreSaleDB).filter(
         PreSaleDB.status == "PENDIENTE",
         PreSaleDB.branch_id == branch_id
@@ -2941,7 +3306,7 @@ def delete_presale(
     presale_id: int,
     branch_id: int = 1,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(cashier())):
     ps = db.query(PreSaleDB).filter(
         PreSaleDB.id == presale_id,
         PreSaleDB.branch_id == branch_id
@@ -2993,7 +3358,7 @@ def get_branch_stock(db: Session, product_id: int, branch_id: int = 1) -> float:
     return float(value or 0.0)
 
 @app.get("/cash/status")
-def get_cash_status(branch_id: int = 1, db: Session = Depends(get_db)):
+def get_cash_status(branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(cashier())):
     active_session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True, CashSessionDB.branch_id == branch_id).first()
     if not active_session:
         return {"is_open": False}
@@ -3006,7 +3371,7 @@ def get_cash_status(branch_id: int = 1, db: Session = Depends(get_db)):
     }
 
 @app.post("/cash/open")
-def open_cash(payload: CashOpenSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+def open_cash(payload: CashOpenSchema, branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(cashier())):
     active = db.query(CashSessionDB).filter(CashSessionDB.is_open == True, CashSessionDB.branch_id == branch_id).first()
     if active:
         raise HTTPException(status_code=400, detail="La caja ya se encuentra abierta")
@@ -3063,7 +3428,7 @@ def serialize_sale_ticket(sale: SaleDB):
         db.close()
 
 @app.post("/sales/finalize")
-def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+def finalize_sale(payload: FinalizeSaleSchema, branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(cashier())):
     active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True,CashSessionDB.branch_id==branch_id).first()
 
     presale = None
@@ -3202,7 +3567,7 @@ def get_sales_history(
     search: Optional[str] = None,
     limit: int = 100,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(cashier(alt="dueno"))):
     safe_limit = min(max(limit, 1), 500)
     query = db.query(SaleDB).filter(SaleDB.branch_id == branch_id)
 
@@ -3265,7 +3630,7 @@ def get_sale_detail(
     sale_id: int,
     branch_id: int = 1,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(cashier(alt="dueno"))):
     sale = db.query(SaleDB).filter(
         SaleDB.id == sale_id,
         SaleDB.branch_id == branch_id
@@ -3276,27 +3641,47 @@ def get_sale_detail(
 
     return serialize_sale_ticket(sale)
 
+def cash_category_key(category: Optional[str]) -> str:
+    """Forma canónica para autorizar: mayúsculas, sin tildes, espacios y guiones como '_'."""
+    import unicodedata
+    raw = unicodedata.normalize("NFKD", (category or "").strip().upper())
+    raw = "".join(ch for ch in raw if not unicodedata.combining(ch))
+    return "_".join(raw.replace("-", " ").split())
+
+
+# U17: pagos a proveedor/mercadería y retiros del dueño (mismos alias que el KPI y Feria).
+PRIVILEGED_OUTFLOW_CATEGORIES = frozenset({
+    "PROVEEDOR", "PROVEEDORES", "PAGO_PROVEEDOR", "MERCADERIA", "COMPRA_MERCADERIA",
+    "RETIRO_DUENO", "OWNER_WITHDRAWAL",
+})
+
+
 @app.post("/cash/movements")
-def create_cash_movement(payload: CashMovementCreateSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+def create_cash_movement(payload: CashMovementCreateSchema, branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(cashier())):
     if payload.amount<=0:
         raise HTTPException(status_code=422, detail="Monto invalido")
-    movement=payload.movement_type.upper()
+    movement=payload.movement_type.strip().upper()
     if movement not in ("IN","OUT"):
         raise HTTPException(status_code=422, detail="movement_type debe ser IN u OUT")
+    # U17: el tipo de egreso se evalúa en backend con la categoría normalizada, no con lo que diga la app.
+    if movement == "OUT" and cash_category_key(payload.category) in PRIVILEGED_OUTFLOW_CATEGORIES \
+            and not has_capability(ctx.user, auth_core.PRIVILEGED_OUTFLOWS_CAPABILITY):
+        raise _auth_error(403, ERROR_FORBIDDEN_CAPABILITY,
+                          "Los pagos a proveedores y retiros del dueño requieren Dueño o un Encargado autorizado.")
     active=db.query(CashSessionDB).filter(CashSessionDB.is_open==True,CashSessionDB.branch_id==branch_id).first()
-    row=CashMovementDB(branch_id=branch_id, session_id=active.id if active else None, movement_type=movement, category=payload.category.upper(), amount=payload.amount, concept=payload.concept, actor=payload.actor, supplier=payload.supplier, employee_email=payload.employee_email, notes=payload.notes)
+    row=CashMovementDB(branch_id=branch_id, session_id=active.id if active else None, movement_type=movement, category=payload.category.strip().upper(), amount=payload.amount, concept=payload.concept, actor=payload.actor, supplier=payload.supplier, employee_email=payload.employee_email, notes=payload.notes)
     db.add(row); db.commit(); db.refresh(row)
     return row
 
 @app.get("/cash/movements")
-def list_cash_movements(session_id: Optional[int]=None, branch_id: int = 1, db: Session=Depends(get_db)):
+def list_cash_movements(session_id: Optional[int]=None, branch_id: int = 1, db: Session=Depends(get_db), ctx: AuthContext = Depends(cashier())):
     q=db.query(CashMovementDB).filter(CashMovementDB.branch_id == branch_id)
     if session_id is not None:
         q=q.filter(CashMovementDB.session_id==session_id)
     return q.order_by(CashMovementDB.id.desc()).limit(500).all()
 
 @app.post("/stock/losses")
-def create_stock_loss(payload: StockLossSchema, branch_id: int = 1, db: Session=Depends(get_db)):
+def create_stock_loss(payload: StockLossSchema, branch_id: int = 1, db: Session=Depends(get_db), ctx: AuthContext = Depends(employee("can_stock", branch="query"))):
     allowed={"VENCIMIENTO","ROTURA","DIFERENCIA_INVENTARIO","CONSUMO_INTERNO","MERMA_CORTE","OTRO"}
     reason=payload.reason.upper().strip()
     if reason not in allowed:
@@ -3310,7 +3695,7 @@ def create_stock_loss(payload: StockLossSchema, branch_id: int = 1, db: Session=
     return {"status":"success","product_id":x.id,"quantity":payload.quantity,"economic_loss":round(cost,2),"reason":reason,"stock":x.stock}
 
 @app.post("/cash/close")
-def close_cash(payload: CashCloseSchema, branch_id: int = 1, db: Session = Depends(get_db)):
+def close_cash(payload: CashCloseSchema, branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(cashier())):
     session = db.query(CashSessionDB).filter(CashSessionDB.is_open == True, CashSessionDB.branch_id == branch_id).first()
     if not session:
         raise HTTPException(status_code=400, detail="No hay una caja abierta para cerrar")
@@ -3356,7 +3741,7 @@ def get_cash_audits(
     date: Optional[str] = None,
     branch_id: int = 1,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(employee("can_verificacion", alt="dueno", branch="query"))):
     query = db.query(CashSessionDB).filter(
         CashSessionDB.branch_id == branch_id
     )
@@ -3386,7 +3771,7 @@ def get_cash_audits(
     return result
 
 @app.patch("/products/{product_id}/replenishment-policy")
-def update_replenishment_policy(product_id: int, payload: ReplenishmentPolicySchema, db: Session = Depends(get_db)):
+def update_replenishment_policy(product_id: int, payload: ReplenishmentPolicySchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee("can_mrp", alt="dueno"))):
     allowed={"MRP","MANUAL","PAUSED","DISCONTINUED"}
     policy=payload.policy.upper().strip()
     if policy not in allowed:
@@ -3408,7 +3793,7 @@ def get_mrp_suggestions(
     target_days: int = 3,
     branch_id: int = 1,
     db: Session = Depends(get_db)
-):
+, ctx: AuthContext = Depends(employee("can_mrp", alt="dueno", branch="query"))):
     since = datetime.datetime.utcnow() - datetime.timedelta(days=days)
 
     sales = db.query(SaleDB).filter(
@@ -3504,7 +3889,7 @@ def append_alert(alerts, key, alert_type, level, title, detail, db, product_id=N
         alerts.append({"id":key,"type":alert_type,"level":level,"severity":level,"title":title,"detail":detail,"state":state,"product_id":product_id,"lot_id":lot_id,"actions":actions or ["SEEN","SNOOZED","RESOLVED","DISMISSED"]})
 
 @app.post("/alerts/{alert_key}/action")
-def update_alert_state(alert_key: str, payload: AlertActionSchema, db: Session = Depends(get_db)):
+def update_alert_state(alert_key: str, payload: AlertActionSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee("can_alertas", alt="dueno"))):
     action=payload.action.upper().strip()
     mapping={"VIEW":"SEEN","SEEN":"SEEN","POSTPONE":"SNOOZED","SNOOZE":"SNOOZED","SNOOZED":"SNOOZED","RESOLVE":"RESOLVED","RESOLVED":"RESOLVED","DISMISS":"DISMISSED","DISMISSED":"DISMISSED","NEW":"NEW"}
     if action not in mapping:
@@ -3525,12 +3910,12 @@ def update_alert_state(alert_key: str, payload: AlertActionSchema, db: Session =
     return {"status":"success","alert_key":alert_key,"state":state.status,"snoozed_until":state.snoozed_until}
 
 @app.get("/alerts/history")
-def get_alert_history(limit: int = 200, db: Session = Depends(get_db)):
+def get_alert_history(limit: int = 200, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee("can_alertas", alt="dueno"))):
     rows=db.query(AuditEventDB).filter(AuditEventDB.entity_type=="alert").order_by(AuditEventDB.created_at.desc()).limit(min(max(limit,1),500)).all()
     return [{"id":x.id,"alert_state_id":x.entity_id,"old_state":x.old_value,"new_state":x.new_value,"actor":x.actor,"note":x.reason,"created_at":x.created_at} for x in rows]
 
 @app.get("/alerts")
-def get_system_alerts(branch_id: int = 1, db: Session = Depends(get_db)):
+def get_system_alerts(branch_id: int = 1, db: Session = Depends(get_db), ctx: AuthContext = Depends(employee("can_alertas", alt="dueno", branch="query"))):
     alerts=[]
     today=datetime.date.today()
     active_lots=db.query(ProductLotDB).join(ProductDB).filter(
@@ -3725,14 +4110,14 @@ def _validate_fair_config(values: dict):
 
 
 @app.get("/branches/{branch_id}/fair-config")
-def get_fair_config(branch_id: int, db: Session = Depends(get_db)):
+def get_fair_config(branch_id: int, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="path"))):
     _require_fair_branch(branch_id, db)
     row = _fair_config_row(db, branch_id)
     return _fair_config_out(branch_id, _fair_config_values(row), row)
 
 
 @app.put("/branches/{branch_id}/fair-config")
-def update_fair_config(branch_id: int, payload: FairConfigUpdateSchema, db: Session = Depends(get_db)):
+def update_fair_config(branch_id: int, payload: FairConfigUpdateSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="path"))):
     _require_fair_branch(branch_id, db)
     current = _fair_config_values(_fair_config_row(db, branch_id))
     values = {k: current[k] for k in fair_planning.DEFAULT_FAIR_CONFIG}
@@ -4011,7 +4396,8 @@ def _plan_detail(db: Session, plan) -> dict:
 
 
 @app.post("/day-plans/preview")
-def preview_day_plan(payload: DayPlanInputSchema, db: Session = Depends(get_db)):
+def preview_day_plan(payload: DayPlanInputSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner())):
+    require_branch_access(db, ctx, payload.branch_id)
     _require_fair_branch(payload.branch_id, db)
     config = _fair_config_values(_fair_config_row(db, payload.branch_id))
     resolved = _resolve_plan_inputs(_schema_dump(payload), config)
@@ -4022,7 +4408,8 @@ def preview_day_plan(payload: DayPlanInputSchema, db: Session = Depends(get_db))
 
 
 @app.post("/day-plans")
-def create_day_plan(payload: DayPlanInputSchema, db: Session = Depends(get_db)):
+def create_day_plan(payload: DayPlanInputSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner())):
+    require_branch_access(db, ctx, payload.branch_id)
     _require_fair_branch(payload.branch_id, db)
     status_value = (payload.status or "BORRADOR").strip().upper()
     if status_value not in DAY_PLAN_EDITABLE_STATUSES:
@@ -4048,7 +4435,7 @@ def create_day_plan(payload: DayPlanInputSchema, db: Session = Depends(get_db)):
 
 
 @app.get("/day-plans")
-def list_day_plans(branch_id: int = FAIR_BRANCH_ID, status: Optional[str] = None, db: Session = Depends(get_db)):
+def list_day_plans(branch_id: int = FAIR_BRANCH_ID, status: Optional[str] = None, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="query", default=FAIR_BRANCH_ID))):
     _require_fair_branch(branch_id, db)
     q = db.query(DayPlanDB).filter(DayPlanDB.branch_id == branch_id)
     if status:
@@ -4067,7 +4454,7 @@ def list_day_plans(branch_id: int = FAIR_BRANCH_ID, status: Optional[str] = None
 
 
 @app.get("/day-plans/open")
-def get_open_day_plan(branch_id: int = FAIR_BRANCH_ID, db: Session = Depends(get_db)):
+def get_open_day_plan(branch_id: int = FAIR_BRANCH_ID, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="query", default=FAIR_BRANCH_ID))):
     """Jornada ABIERTA de la sucursal (como máximo una)."""
     _require_fair_branch(branch_id, db)
     plan = _open_fair_session(db, branch_id)
@@ -4075,12 +4462,12 @@ def get_open_day_plan(branch_id: int = FAIR_BRANCH_ID, db: Session = Depends(get
 
 
 @app.get("/day-plans/{plan_id}")
-def get_day_plan(plan_id: int, db: Session = Depends(get_db)):
+def get_day_plan(plan_id: int, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="day_plan"))):
     return _plan_detail(db, _get_plan_or_404(db, plan_id))
 
 
 @app.put("/day-plans/{plan_id}")
-def update_day_plan(plan_id: int, payload: DayPlanUpdateSchema, db: Session = Depends(get_db)):
+def update_day_plan(plan_id: int, payload: DayPlanUpdateSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="day_plan"))):
     plan = _get_plan_or_404(db, plan_id)
     if plan.status not in DAY_PLAN_EDITABLE_STATUSES:
         raise HTTPException(status_code=409, detail=f"No se puede editar un plan en estado {plan.status}")
@@ -4125,7 +4512,7 @@ def update_day_plan(plan_id: int, payload: DayPlanUpdateSchema, db: Session = De
 
 
 @app.post("/day-plans/{plan_id}/recalculate")
-def recalculate_day_plan(plan_id: int, payload: Optional[DayPlanRecalculateSchema] = None, db: Session = Depends(get_db)):
+def recalculate_day_plan(plan_id: int, payload: Optional[DayPlanRecalculateSchema] = None, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="day_plan"))):
     plan = _get_plan_or_404(db, plan_id)
     if plan.status not in DAY_PLAN_EDITABLE_STATUSES:
         raise HTTPException(status_code=409, detail=f"No se puede recalcular un plan en estado {plan.status}")
@@ -4144,7 +4531,7 @@ def recalculate_day_plan(plan_id: int, payload: Optional[DayPlanRecalculateSchem
 
 
 @app.patch("/day-plans/{plan_id}/status")
-def change_day_plan_status(plan_id: int, payload: DayPlanStatusSchema, db: Session = Depends(get_db)):
+def change_day_plan_status(plan_id: int, payload: DayPlanStatusSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="day_plan"))):
     plan = _get_plan_or_404(db, plan_id)
     new_status = payload.status.strip().upper()
     if new_status not in DAY_PLAN_STATUSES:
@@ -4158,7 +4545,7 @@ def change_day_plan_status(plan_id: int, payload: DayPlanStatusSchema, db: Sessi
     if new_status == "CANCELADA":
         # Baja lógica: el plan y sus cálculos quedan guardados.
         stamp = ar_now().strftime("%d/%m/%Y %H:%M")
-        note = f"[CANCELADA {stamp}{' por ' + payload.actor if payload.actor else ''}{': ' + payload.reason if payload.reason else ''}]"
+        note = f"[CANCELADA {stamp} por {ctx.actor_email}{': ' + payload.reason if payload.reason else ''}]"
         plan.notes = f"{plan.notes}\n{note}" if plan.notes else note
     plan.status = new_status
     plan.updated_by = payload.actor
@@ -4192,18 +4579,12 @@ def _plan_can_open_on(plan, today_ar: datetime.date) -> bool:
     return datetime.date.fromisoformat(plan.start_date) <= today_ar <= datetime.date.fromisoformat(plan.end_date)
 
 
-def _require_fair_session_actor(db: Session, actor: Optional[str]) -> str:
-    # Validación de COHERENCIA, no autenticación real: el backend todavía no verifica
-    # tokens, así que no puede comprobar que el email informado sea el de quien opera.
-    email = (actor or "").strip()
-    if not email:
-        raise HTTPException(status_code=422, detail="Indicá el usuario que inicia o cierra la jornada")
-    user = db.query(UserDB).filter(func.lower(UserDB.email) == email.lower()).first()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=403, detail="El usuario no existe o está inhabilitado")
-    if (user.role or "") not in FAIR_SESSION_ROLES:
-        raise HTTPException(status_code=403, detail="Solo administración o dueño pueden iniciar o cerrar la jornada")
-    return user.email
+def _require_fair_session_actor(ctx: AuthContext) -> str:
+    """Fase 2.2: quien abre o cierra es el usuario de la sesión (el `actor` del cuerpo se ignora).
+    La política de la ruta ya exige Dueño o superior; esto lo vuelve a comprobar."""
+    if (ctx.user.role or "") not in FAIR_SESSION_ROLES:
+        raise _auth_error(403, ERROR_FORBIDDEN_ROLE, "Solo administración o dueño pueden iniciar o cerrar la jornada")
+    return ctx.user.email
 
 
 def _open_fair_session(db: Session, branch_id: int):
@@ -4294,8 +4675,8 @@ def _session_summary(db: Session, plan) -> Optional[dict]:
 
 
 @app.post("/day-plans/{plan_id}/open")
-def open_day_plan_session(plan_id: int, payload: DayPlanSessionActionSchema, db: Session = Depends(get_db)):
-    actor = _require_fair_session_actor(db, payload.actor)
+def open_day_plan_session(plan_id: int, payload: DayPlanSessionActionSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="day_plan"))):
+    actor = _require_fair_session_actor(ctx)
     plan = _get_plan_or_404(db, plan_id)
     _require_fair_branch(plan.branch_id, db)
     if plan.status == "ABIERTA":
@@ -4334,7 +4715,7 @@ def open_day_plan_session(plan_id: int, payload: DayPlanSessionActionSchema, db:
 
 
 @app.get("/day-plans/{plan_id}/live")
-def get_day_plan_live(plan_id: int, db: Session = Depends(get_db)):
+def get_day_plan_live(plan_id: int, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="day_plan"))):
     plan = _get_plan_or_404(db, plan_id)
     if plan.status == "CERRADA":
         if not plan.final_results_json:
@@ -4348,8 +4729,8 @@ def get_day_plan_live(plan_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/day-plans/{plan_id}/close")
-def close_day_plan_session(plan_id: int, payload: DayPlanSessionActionSchema, db: Session = Depends(get_db)):
-    actor = _require_fair_session_actor(db, payload.actor)
+def close_day_plan_session(plan_id: int, payload: DayPlanSessionActionSchema, db: Session = Depends(get_db), ctx: AuthContext = Depends(owner(branch="day_plan"))):
+    actor = _require_fair_session_actor(ctx)
     plan = _get_plan_or_404(db, plan_id)
     if plan.status == "CERRADA":
         raise HTTPException(status_code=409, detail="La jornada ya fue cerrada")

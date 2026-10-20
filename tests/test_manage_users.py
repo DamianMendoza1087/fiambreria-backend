@@ -15,8 +15,9 @@ def wipe():
     conn = sqlite3.connect(_DB_PATH)
     ids = [r[0] for r in conn.execute("SELECT id FROM users WHERE email LIKE '%@mu.test'")]
     conn.execute("DELETE FROM auth_login_failures")
-    conn.execute("DELETE FROM auth_sessions")
     for uid in ids:
+        conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (uid,))
+        conn.execute("DELETE FROM user_branches WHERE user_id = ?", (uid,))
         conn.execute("DELETE FROM user_credentials WHERE user_id = ?", (uid,))
         conn.execute("DELETE FROM audit_events WHERE entity_type = 'user' AND entity_id = ?", (uid,))
     conn.execute("DELETE FROM users WHERE email LIKE '%@mu.test'")

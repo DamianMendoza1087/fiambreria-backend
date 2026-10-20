@@ -115,6 +115,8 @@ out["audit_cols"] = sorted(r[1] for r in q("PRAGMA table_info(audit_events)"))
 out["audit_old"] = q("SELECT entity_type, actor, reason, actor_user_id, actor_source FROM audit_events")
 out["migrations"] = q("SELECT version FROM schema_migrations")
 out["tables"] = sorted(r[0] for r in q("SELECT name FROM sqlite_master WHERE type='table'"))
+out["user_branches"] = q("SELECT user_id, branch_id FROM user_branches ORDER BY user_id")
+out["privileged"] = q("SELECT id, can_cash_privileged_outflows FROM users ORDER BY id")
 """
     first, _ = run(startup, tmp_path, dev_env(db))
     # Arrancar NO crea credenciales ni modifica las contraseñas heredadas.
@@ -123,8 +125,12 @@ out["tables"] = sorted(r[0] for r in q("SELECT name FROM sqlite_master WHERE typ
                                   ["baja@proc.test", "clave de la baja"]]
     assert {"actor_user_id", "actor_source", "session_id"} <= set(first["audit_cols"])
     assert first["audit_old"] == [["product", "alguien", "historico", None, None]]
-    assert first["migrations"] == [["2.1-auth"]]
-    assert {"user_credentials", "auth_sessions", "auth_login_failures", "schema_migrations"} <= set(first["tables"])
+    assert sorted(first["migrations"]) == [["2.1-auth"], ["2.2-authz"]]
+    assert {"user_credentials", "auth_sessions", "auth_login_failures", "schema_migrations",
+            "user_branches"} <= set(first["tables"])
+    # 2.2: cada usuario queda asignado a la sucursal que ya tenía; el permiso privilegiado arranca apagado.
+    assert first["user_branches"] == [[1, 1], [2, 2], [3, 1]]
+    assert first["privileged"] == [[1, 0], [2, 0], [3, 0]]
 
     second, _ = run(startup, tmp_path, dev_env(db))
     assert second == first                                          # reiniciar no cambia nada

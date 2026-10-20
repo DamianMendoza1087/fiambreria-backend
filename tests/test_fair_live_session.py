@@ -19,6 +19,7 @@ import pytest
 from test_day_plans_api import (  # noqa: E402  (fija DATABASE_URL temporal antes de importar main)
     REPO_DIR, _DB_PATH, _run, add_lot, add_product, client, main, weekend_payload,
 )
+import authkit  # noqa: E402
 import fair_planning  # noqa: E402
 
 SAT_OPEN = datetime.datetime(2026, 10, 17, 12, 0)    # sábado 09:00 AR
@@ -73,12 +74,17 @@ def single_day_plan(date="17/10/2026", plan_type="SABADO"):
     return r.json()["plan"]["id"]
 
 
+def as_user(email):
+    """Fase 2.2: quien abre o cierra es el usuario de la sesión (con acceso a ambas sucursales)."""
+    return authkit.headers_for(main, email, branch_ids=[1, 2])
+
+
 def open_plan(plan_id, actor="dueno@live.test"):
-    return client.post(f"/day-plans/{plan_id}/open", json={"actor": actor})
+    return client.post(f"/day-plans/{plan_id}/open", json={"actor": actor}, headers=as_user(actor))
 
 
 def close_plan(plan_id, actor="dueno@live.test"):
-    return client.post(f"/day-plans/{plan_id}/close", json={"actor": actor})
+    return client.post(f"/day-plans/{plan_id}/close", json={"actor": actor}, headers=as_user(actor))
 
 
 def live(plan_id):
@@ -205,13 +211,18 @@ def test_status_patch_still_cannot_open_or_close(clock):
         assert client.patch(f"/day-plans/{pid}/status", json={"status": status}).status_code == 422
 
 
-@pytest.mark.parametrize("actor,code", [(None, 422), ("", 422), ("vende@live.test", 403),
-                                        ("baja@live.test", 403), ("nadie@live.test", 403)])
-def test_actor_coherence_check(clock, actor, code):
-    # Comprobación de coherencia (no autenticación real).
+@pytest.mark.parametrize("actor,code", [("vende@live.test", 403), ("baja@live.test", 401)])
+def test_only_owner_or_admin_session_can_open(clock, actor, code):
+    # Fase 2.2: lo decide la sesión (vendedor -> 403 por rol; usuario deshabilitado -> 401).
     pid = create_plan()
-    assert client.post(f"/day-plans/{pid}/open", json={"actor": actor}).status_code == code
+    assert client.post(f"/day-plans/{pid}/open", json={"actor": actor}, headers=as_user(actor)).status_code == code
     assert client.get(f"/day-plans/{pid}").json()["plan"]["status"] == "BORRADOR"
+
+
+def test_actor_in_body_is_ignored(clock):
+    pid = create_plan()
+    r = client.post(f"/day-plans/{pid}/open", json={"actor": "vende@live.test"}, headers=as_user("dueno@live.test"))
+    assert r.status_code == 200 and r.json()["opened_by"] == "dueno@live.test"
 
 
 def test_superadmin_can_open_and_close(clock):
@@ -619,25 +630,29 @@ def test_ar_money_format():
 # ---------- Base SQLite existente ----------
 
 SEED_OLD = """
-import sys
+import sys, os
 sys.path.insert(0, {repo!r})
-import main
+sys.path.insert(0, os.path.join({repo!r}, "tests"))
+import main, authkit
 db = main.SessionLocal()
 s = main.SaleDB(branch_id=2, total_amount=1500); db.add(s); db.flush()
 db.add(main.SaleItemDB(sale_id=s.id, product_id=1, quantity=1, unit_price=1500, cogs=800, gross_profit=700))
 db.commit(); db.close()
 from fastapi.testclient import TestClient
 c = TestClient(main.app)
+c.headers.update(authkit.headers_for(main, "admin@fiambreria.com"))
 r = c.post("/day-plans", json={{"branch_id": 2, "plan_type": "FIN_DE_SEMANA", "start_date": "17/10/2026"}})
 assert r.status_code == 200, r.text
 """
 
 CHECK_LIVE = """
-import sys
+import sys, os
 sys.path.insert(0, {repo!r})
-import main
+sys.path.insert(0, os.path.join({repo!r}, "tests"))
+import main, authkit
 from fastapi.testclient import TestClient
 c = TestClient(main.app)
+c.headers.update(authkit.headers_for(main, "admin@fiambreria.com"))
 assert c.get("/health").json()["database_ready"] is True
 plans = c.get("/day-plans?branch_id=2").json()
 assert len(plans) == 1 and plans[0]["status"] == "BORRADOR" and plans[0]["opened_at"] is None

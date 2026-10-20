@@ -83,14 +83,14 @@ columnas `opened_at`, `opened_by`, `closed_at`, `closed_by`, `final_results_json
 Endpoints:
 
 - `GET /day-plans/open?branch_id=2`: jornada en curso (o `open: false`).
-- `POST /day-plans/{id}/open` `{actor}`: solo BORRADOR/PLANIFICADA y con la fecha argentina de hoy
+- `POST /day-plans/{id}/open`: solo BORRADOR/PLANIFICADA y con la fecha argentina de hoy
   dentro de `start_date..end_date`. Una sola ABIERTA por sucursal (API + índice).
 - `GET /day-plans/{id}/live`: ABIERTA calcula en vivo; CERRADA devuelve `final_results_json`
   tal cual (nunca recalcula).
-- `POST /day-plans/{id}/close` `{actor}`: solo ABIERTA; guarda el resultado final congelado.
+- `POST /day-plans/{id}/close`: solo ABIERTA; guarda el resultado final congelado.
 
-`actor` debe ser un usuario activo con rol masteradmin, superadmin o dueno. **Es una
-validación de coherencia, no autenticación**: el backend todavía no verifica tokens.
+Desde la Fase 2.2 quien abre o cierra es el usuario de la sesión (masteradmin, superadmin o dueno con
+acceso a la sucursal del plan); un `actor` enviado en el cuerpo se ignora.
 No hay apertura ni cierre automáticos; si sigue abierta después de `end_date` se advierte.
 
 ## Fase 1 — Retirar / Reactivar por sucursal, backup y diagnóstico
@@ -133,7 +133,8 @@ autenticación (eso llega en la fase de autenticación).
 
 ## Parche de seguridad U1 — usuarios (previo a Fase 2.1)
 
-Todavía no hay autenticación real. Mientras tanto:
+Histórico: en la Fase 2.2 los bloqueos temporales de este parche se reemplazaron por autorización real
+(ver más abajo). Lo que sigue vigente es la lista blanca de campos. Texto original:
 
 - `GET /users`, `POST /users` y `PATCH /users/{id}/permissions` devuelven solo campos no sensibles
   (`serialize_user`, lista blanca `USER_PUBLIC_FIELDS`). Nunca devuelven contraseñas.
@@ -149,7 +150,7 @@ Todavía no hay autenticación real. Mientras tanto:
 
 ## Fase 2.1 — Autenticación (credenciales, sesiones, bloqueo, recuperación)
 
-En 2.1 los endpoints de negocio siguen sin exigir sesión (eso es 2.2). Lo nuevo:
+En 2.1 los endpoints de negocio siguen sin exigir sesión (eso es 2.2, más abajo). Lo nuevo:
 
 - **Contraseñas**: PBKDF2-SHA256, 600.000 iteraciones, sal de 16 bytes (`auth_core.py`, biblioteca
   estándar). Se guardan en la tabla `user_credentials`, separada de `users`: ninguna respuesta de
@@ -187,3 +188,39 @@ En 2.1 los endpoints de negocio siguen sin exigir sesión (eso es 2.2). Lo nuevo
     (idempotente; no borra el texto heredado).
   - `python manage_users.py list-admins` — sin secretos.
 - La columna heredada `users.hashed_password` no se borra todavía (U8=A).
+
+## Fase 2.2 — Autorización estricta
+
+Todos los endpoints exigen sesión salvo `GET /health` y `POST /login`. No existe modo legacy, bypass
+anónimo ni interruptor de emergencia: una APK sin token recibe 401 en todo lo demás.
+
+- **Una política por ruta** (`Policy` en `main.py`, reglas en `auth_core.py`): rol mínimo, capacidades
+  `can_*` y origen de la sucursal (`branch_id` del query, `{branch_id}` de la URL, la sucursal guardada del
+  plan o la del cuerpo). `main.route_policies()` lista la matriz y `tests/test_authz.py` falla si aparece una
+  ruta sin política o con más de una.
+- **Jerarquía**: masteradmin > superadmin > dueno > encargado > cajero > vendedor (Empleado de mostrador).
+  MASTERADMIN y SUPERADMIN tienen todas las capacidades y todas las sucursales activas; el resto, solo sus
+  sucursales asignadas (`user_branches`, tabla aditiva sembrada con la sucursal actual de cada usuario).
+- **Códigos** (`X-Error-Code`): `AUTH_REQUIRED`/`SESSION_*` (401), `PASSWORD_CHANGE_REQUIRED`,
+  `FORBIDDEN_ROLE`, `FORBIDDEN_CAPABILITY`, `FORBIDDEN_BRANCH`, `FORBIDDEN_USER_ADMIN` (403),
+  `LAST_MASTERADMIN` (409), `DEFAULT_PASSWORD_RESET_REQUIRED` (403).
+- **Actor**: los campos de actor (`actor`, `sold_by`, `opened_by`, `created_by`, …) se completan con el email
+  de la sesión antes de guardar (evento `before_flush`); los `audit_events` nuevos llevan además
+  `actor_user_id`, `actor_source=session` y `session_id`. Lo que mande la app en esos campos se ignora.
+- **Usuarios**: SUPERADMIN o superior administra; MASTERADMIN administra a todos salvo a sí mismo; SUPERADMIN
+  hasta Dueño (nunca crea, promueve ni modifica MASTERADMIN/SUPERADMIN); nadie cambia su propio rol ni estado;
+  siempre queda al menos un MASTERADMIN activo. `POST /users/{id}/reset-password` devuelve una contraseña
+  temporal una sola vez (`Cache-Control: no-store`), obliga a cambiarla y cierra las sesiones del usuario.
+  `PATCH /users/{id}/permissions` acepta `branch_ids` (lista) o `branch_id` (reemplaza por esa sola).
+- **Egresos privilegiados (U17)**: `can_cash_privileged_outflows` (apagado por defecto). Pagos a proveedor /
+  mercadería y retiros del dueño (`POST /cash/movements` OUT, categoría normalizada sin tildes ni espacios)
+  requieren Dueño o superior, o Encargado con la capacidad. Cajero y Empleado nunca, aunque esté guardada.
+  Las mermas (`POST /stock/losses`) requieren `can_stock`.
+- **Turnos (U16)**: cada uno abre y cierra su propio turno; el de otro requiere Encargado o superior con
+  `can_rrhh` y que el empleado comparta sucursal. El rol trabajado no supera el rol real.
+- **Feria**: plan, jornada en vivo, apertura y cierre requieren Dueño o superior con acceso a la sucursal.
+- **admin123**: una credencial `DEFAULT_PASSWORD` puede iniciar sesión solo para ver `/auth/me` y cerrar
+  sesión; `/auth/change-password` responde 403 `DEFAULT_PASSWORD_RESET_REQUIRED`. La salida es un reset
+  (Render Shell o un administrador), que deja una clave temporal de un uso.
+- **Migración** (`ensure_authz_schema`, aditiva e idempotente, versión `2.2-authz`): columna
+  `users.can_cash_privileged_outflows` (0) y tabla `user_branches`. No toca credenciales ni la columna heredada.

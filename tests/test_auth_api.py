@@ -12,7 +12,7 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from test_day_plans_api import _DB_PATH, client, main  # noqa: E402
+from test_day_plans_api import _DB_PATH, anon, client, main  # noqa: E402
 import auth_core  # noqa: E402
 
 STRONG = "salame tandilero 2026"
@@ -37,8 +37,10 @@ def wipe():
     conn = sqlite3.connect(_DB_PATH)
     ids = [r[0] for r in conn.execute("SELECT id FROM users WHERE email LIKE '%@auth.test'")]
     conn.execute("DELETE FROM auth_login_failures")
-    conn.execute("DELETE FROM auth_sessions")
     for uid in ids:
+        # Solo las sesiones de estos usuarios: la sesión de administración del cliente de tests sigue viva.
+        conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (uid,))
+        conn.execute("DELETE FROM user_branches WHERE user_id = ?", (uid,))
         conn.execute("DELETE FROM user_credentials WHERE user_id = ?", (uid,))
         conn.execute("DELETE FROM audit_events WHERE entity_type = 'user' AND entity_id = ?", (uid,))
     conn.execute("DELETE FROM users WHERE email LIKE '%@auth.test'")
@@ -180,33 +182,70 @@ def test_master_seed_in_test_db_is_hashed_and_flagged():
 
 # --- admin123 y cambio obligatorio ----------------------------------------------------------------
 
-def test_admin123_requires_change_and_cannot_operate_until_changed():
+def test_admin123_cannot_be_used_to_take_over_and_exits_only_through_reset():
+    """Decisión B (2.2): una credencial DEFAULT_PASSWORD no puede elegir su nueva clave."""
     uid = add_user("maestro@auth.test", role="masteradmin", legacy="admin123")
     r = login("maestro@auth.test", "admin123")
     assert r.status_code == 200 and r.json()["password_change_reason"] == "DEFAULT_PASSWORD"
     token = r.json()["access_token"]
 
-    # /auth/me funciona para poder mostrar la pantalla de cambio, pero no se puede operar.
-    assert client.get("/auth/me", headers=bearer(token)).json()["must_change_password"] is True
+    # /auth/me funciona (pantalla informativa), pero no se puede operar ni cambiar la clave.
+    assert anon.get("/auth/me", headers=bearer(token)).json()["must_change_password"] is True
     blocked = probe.get("/probe", headers=bearer(token))
     assert blocked.status_code == 403 and code(blocked) == "PASSWORD_CHANGE_REQUIRED"
+    assert anon.get("/users", headers=bearer(token)).status_code == 403
+    for new in (STRONG, "admin123"):
+        r = anon.post("/auth/change-password", headers=bearer(token),
+                      json={"current_password": "admin123", "new_password": new})
+        assert r.status_code == 403 and code(r) == "DEFAULT_PASSWORD_RESET_REQUIRED"
+    assert login("maestro@auth.test", STRONG).status_code == 400          # el intruso no fijó nada
+    assert query("SELECT 1 FROM user_credentials WHERE user_id = ?", (uid,)) == []
 
-    # No se puede elegir admin123 de nuevo.
-    r = client.post("/auth/change-password", headers=bearer(token),
-                    json={"current_password": "admin123", "new_password": "admin123"})
+    # Salida: reset desde una sesión autorizada (aquí MASTERADMIN) -> clave temporal de un uso.
+    r = client.post(f"/users/{uid}/reset-password")
+    assert r.status_code == 200 and r.headers["Cache-Control"] == "no-store"
+    temporary = r.json()["temporary_password"]
+    assert r.json()["sessions_revoked"] == 1
+    assert code(anon.get("/auth/me", headers=bearer(token))) == "SESSION_REVOKED"
+    assert login("maestro@auth.test", "admin123").status_code == 400
+    r = login("maestro@auth.test", temporary)
+    assert r.status_code == 200 and r.json()["password_change_reason"] == "TEMPORARY"
+    token = r.json()["access_token"]
+    r = anon.post("/auth/change-password", headers=bearer(token),
+                  json={"current_password": temporary, "new_password": "admin123"})
     assert r.status_code == 422 and code(r) == "PASSWORD_POLICY"
-
-    r = client.post("/auth/change-password", headers=bearer(token),
-                    json={"current_password": "admin123", "new_password": STRONG})
+    r = anon.post("/auth/change-password", headers=bearer(token),
+                  json={"current_password": temporary, "new_password": STRONG})
     assert r.status_code == 200 and r.json()["must_change_password"] is False
     ok = probe.get("/probe", headers=bearer(token))
     assert ok.status_code == 200
     assert ok.json() == {"actor": "maestro@auth.test", "actor_user_id": uid, "actor_source": "session"}
-
-    assert login("maestro@auth.test", "admin123").status_code == 400
+    assert login("maestro@auth.test", temporary).status_code == 400         # la temporal no se reutiliza
     assert login("maestro@auth.test", STRONG).json()["must_change_password"] is False
     # U8=A: el texto heredado sigue en la base para rollback, pero ya no permite entrar.
     assert query("SELECT hashed_password FROM users WHERE id = ?", (uid,)) == [("admin123",)]
+
+
+def test_hashed_default_credential_is_also_protected():
+    uid = add_user("semilla@auth.test", role="masteradmin", password="admin123", must_change=True,
+                   reason="DEFAULT_PASSWORD")
+    token = token_for("semilla@auth.test", "admin123")
+    r = anon.post("/auth/change-password", headers=bearer(token),
+                  json={"current_password": "admin123", "new_password": STRONG})
+    assert r.status_code == 403 and code(r) == "DEFAULT_PASSWORD_RESET_REQUIRED"
+    assert query("SELECT change_reason FROM user_credentials WHERE user_id = ?", (uid,)) == [("DEFAULT_PASSWORD",)]
+    assert anon.post("/auth/logout", headers=bearer(token)).status_code == 200
+
+
+def test_temporary_and_legacy_credentials_can_still_change_password():
+    add_user("temp@auth.test", password=STRONG, must_change=True, reason="TEMPORARY")
+    token = token_for("temp@auth.test")
+    assert anon.post("/auth/change-password", headers=bearer(token),
+                     json={"current_password": STRONG, "new_password": OTHER}).status_code == 200
+    add_user("legado@auth.test", legacy="clave heredada uno")
+    token = token_for("legado@auth.test", "clave heredada uno")
+    assert anon.post("/auth/change-password", headers=bearer(token),
+                     json={"current_password": "clave heredada uno", "new_password": OTHER}).status_code == 200
 
 
 # --- Usuario deshabilitado ------------------------------------------------------------------------
@@ -352,7 +391,7 @@ def test_auth_settings_defaults_and_invalid_values(monkeypatch):
 
 def test_missing_invalid_and_revoked_tokens():
     add_user("ok@auth.test", password=STRONG)
-    r = client.get("/auth/me")
+    r = anon.get("/auth/me")
     assert r.status_code == 401 and code(r) == "AUTH_REQUIRED" and r.headers["WWW-Authenticate"] == "Bearer"
     assert code(client.get("/auth/me", headers={"Authorization": "Basic abc"})) == "AUTH_REQUIRED"
     assert code(client.get("/auth/me", headers=bearer("inventado"))) == "SESSION_INVALID"
@@ -440,8 +479,8 @@ def test_password_change_validations():
         r = client.post("/auth/change-password", headers=bearer(token),
                         json={"current_password": STRONG, "new_password": new})
         assert r.status_code == 422 and r.headers["X-Policy-Code"] == policy
-    assert client.post("/auth/change-password", json={"current_password": STRONG,
-                                                      "new_password": OTHER}).status_code == 401
+    assert anon.post("/auth/change-password", json={"current_password": STRONG,
+                                                    "new_password": OTHER}).status_code == 401
 
 
 def test_rehash_on_login_when_iterations_increase(monkeypatch):

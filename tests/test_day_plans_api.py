@@ -28,7 +28,13 @@ import main  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 assert main.SQLALCHEMY_DATABASE_URL == f"sqlite:///{_DB_PATH}"
+import authkit  # noqa: E402
+
+# Fase 2.2: toda la API exige sesión. El cliente compartido opera como un MASTERADMIN de tests
+# (todas las sucursales y permisos); `anon` no envía credenciales.
 client = TestClient(main.app)
+client.headers.update(authkit.headers_for(main, authkit.ADMIN_EMAIL, role="masteradmin"))
+anon = TestClient(main.app)
 
 SATURDAY = "17/10/2026"
 CLEAN_TABLES = ("day_plan_snapshots", "day_plans", "fair_cost_configs", "sale_items", "sales",
@@ -325,11 +331,14 @@ db.commit(); db.close()
 """
 
 CHECK_SCRIPT = """
-import sys
+import sys, os
 sys.path.insert(0, {repo!r})
-import main
+sys.path.insert(0, os.path.join({repo!r}, "tests"))
+import main, authkit
 from fastapi.testclient import TestClient
 c = TestClient(main.app)
+# Sesión de la cuenta maestra ya existente: no agrega filas a users.
+c.headers.update(authkit.headers_for(main, "admin@fiambreria.com"))
 assert c.get("/health").json()["database_ready"] is True
 assert c.get("/branches/2/fair-config").status_code == 200
 print("OK")

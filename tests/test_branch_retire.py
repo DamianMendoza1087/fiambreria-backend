@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from test_day_plans_api import _DB_PATH, add_lot, client, main  # noqa: E402
+from authkit import ADMIN_EMAIL  # noqa: E402
 
 TABLES = ("audit_events", "presale_items", "presales", "sale_items", "sales", "cash_movements",
           "cash_sessions", "product_ingresses", "stock_movements", "product_lots", "branch_products",
@@ -104,7 +105,8 @@ def test_retire_without_stock_hides_product_but_keeps_master_and_history():
     assert client.get("/products/by-barcode/7790000000017?branch_id=2").status_code == 404
     assert client.get("/products/master/by-barcode/7790000000017").status_code == 200   # maestro intacto
 
-    assert audit_rows(pid) == [("True", "False", "dueno@test", "Ya no se vende en Feria")]
+    # Fase 2.2: el actor es el usuario de la sesión, no el `actor` enviado en la consulta.
+    assert audit_rows(pid) == [("True", "False", ADMIN_EMAIL, "Ya no se vende en Feria")]
 
 
 def test_retired_product_cannot_be_presold_or_sold():
@@ -183,7 +185,7 @@ def test_reactivate_restores_availability_with_branch_price():
     assert r.json()["branch_status"] == "DISPONIBLE" and r.json()["price_per_unit"] == 5000.0
     sold = next(p for p in client.get("/products?branch_id=2").json() if p["id"] == pid)
     assert sold["price_per_unit"] == 5000.0
-    assert audit_rows(pid)[-1][:3] == ("False", "True", "dueno@test")
+    assert audit_rows(pid)[-1][:3] == ("False", "True", ADMIN_EMAIL)
 
 
 @pytest.mark.parametrize("price", [None, 0.0])
@@ -252,7 +254,7 @@ def test_ingress_on_retired_product_requires_explicit_reactivation():
     assert r.status_code == 200, r.text
     assert lots_of(pid, 2) == [(7, 7, 1500)]
     assert config_row(pid, 2)["is_available"] is True
-    assert audit_rows(pid)[-1][:3] == ("False", "True", "recibe@test")
+    assert audit_rows(pid)[-1][:3] == ("False", "True", ADMIN_EMAIL)
 
 
 def test_retired_with_price_and_confirmation_ingresses_and_reactivates():

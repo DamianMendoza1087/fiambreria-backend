@@ -88,6 +88,48 @@ def can_assign_role(actor_role: str, actor_id: int, target_id: Optional[int],
     return None
 
 
+CAPABILITIES = (
+    "can_preventa", "can_caja", "can_stock", "can_ingreso", "can_alertas", "can_rrhh", "can_mrp",
+    "can_verificacion", "can_kpis", "can_carteleria", "can_edit_records", "can_cash_privileged_outflows",
+)
+PRIVILEGED_OUTFLOWS_CAPABILITY = "can_cash_privileged_outflows"
+
+
+def capability_allowed(role: Optional[str], capability: str, stored_value) -> bool:
+    """Regla única de capacidades (U15/U17).
+
+    - MASTERADMIN y SUPERADMIN tienen todas.
+    - can_cash_privileged_outflows: Dueño o superior por rol; Encargado solo si la tiene concedida;
+      Cajero y Empleado nunca, aunque el valor guardado sea verdadero.
+    - El resto de las can_*: según el valor guardado.
+    """
+    role = (role or "").strip().lower()
+    if capability not in CAPABILITIES:
+        return False
+    if capability == PRIVILEGED_OUTFLOWS_CAPABILITY:
+        if role_level(role) >= role_level("dueno"):
+            return True
+        return role == "encargado" and bool(stored_value)
+    if role in ADMIN_ROLES:
+        return True
+    return bool(stored_value)
+
+
+def can_manage_user(actor_role: str, actor_id: int, target_role: Optional[str], target_id: int) -> Optional[str]:
+    """None si el actor puede modificar estado, permisos, sucursales o contraseña del destino (U3/U4)."""
+    actor_role = (actor_role or "").strip().lower()
+    target_role = (target_role or "").strip().lower()
+    if actor_id == target_id:
+        return "No podés modificar tu propio usuario desde administración"
+    if actor_role == "masteradmin":
+        return None
+    if actor_role != "superadmin":
+        return "Solo MASTERADMIN o SUPERADMIN administran usuarios"
+    if target_role in ADMIN_ROLES or role_level(target_role) >= role_level(actor_role):
+        return "Un SUPERADMIN administra usuarios hasta Dueño"
+    return None
+
+
 def violates_last_masteradmin(active_masteradmin_ids: Iterable[int], target_id: int,
                               target_role_after: Optional[str], target_active_after: bool) -> bool:
     """True si el cambio dejaría el sistema sin ningún MASTERADMIN activo (U5=A, mínimo 1)."""

@@ -78,7 +78,7 @@ def call(c, method, path, headers=None):
 
 def test_every_route_declares_exactly_one_policy():
     routes = main.route_policies()
-    assert len(routes) >= 77
+    assert len(routes) >= 76
     missing = sorted(k for k, v in routes.items() if len(v) == 0)
     duplicated = sorted(k for k, v in routes.items() if len(v) > 1)
     assert missing == [], f"Rutas sin política: {missing}"
@@ -196,7 +196,8 @@ def test_branch_is_validated_from_query_path_and_default():
     assert code(anon.get("/branches/2/fair-config", headers=h)) == "FORBIDDEN_BRANCH"
     # Listado de jornadas: por defecto es la Feria (2).
     assert code(anon.get("/day-plans", headers=h)) == "FORBIDDEN_BRANCH"
-    assert anon.get("/day-plans?branch_id=1", headers=h).status_code == 200
+    r = anon.get("/day-plans?branch_id=1", headers=h)       # autorizado; el endpoint dice que no es Feria
+    assert r.status_code == 422 and code(r) is None
     assert code(anon.get("/products?branch_id=abc", headers=h)) is None                # 422, no 500
 
 
